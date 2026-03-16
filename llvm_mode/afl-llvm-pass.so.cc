@@ -263,7 +263,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                 {Int32Ty, PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0)},
                 false);
             
-            Constant *CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
+            FunctionCallee CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
             
             IRBuilder<> TaintIRB(&I);
             TaintIRB.SetInsertPoint(&I);
@@ -274,7 +274,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                 Int32Ty,  
                 {PointerType::get(Int8Ty, 0), Int32Ty},
                 false);
-            Constant *GetTaintFn = M.getOrInsertFunction("__afl_taint_load", GetTaintTy);
+            FunctionCallee GetTaintFn = M.getOrInsertFunction("__afl_taint_load", GetTaintTy);
             
             Value *Op1Tag = TaintIRB.CreateCall(GetTaintFn, {
                 TaintIRB.CreateBitCast(Op1, PointerType::get(Int8Ty, 0)),
@@ -290,7 +290,8 @@ bool AFLCoverage::runOnModule(Module &M) {
                 Type::getVoidTy(C),
                 {Int32Ty, Int32Ty, Int32Ty},
                 false);
-            Constant *CheckTaintWithTagsFn = M.getOrInsertFunction("__afl_check_taint_with_tags", CheckTaintWithTagsTy);
+            FunctionCallee CheckTaintWithTagsFn =
+                M.getOrInsertFunction("__afl_check_taint_with_tags", CheckTaintWithTagsTy);
             
             TaintIRB.CreateCall(CheckTaintWithTagsFn, {
                 ConstantInt::get(Int32Ty, cmp_id),
@@ -308,7 +309,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                   Type::getVoidTy(C),
                   {Int32Ty, PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0)},
                   false);
-              Constant *CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
+              FunctionCallee CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
               IRBuilder<> TaintIRB(&I);
               Value *CondPtr = TaintIRB.CreateBitCast(Cond, PointerType::get(Int8Ty, 0));
               TaintIRB.CreateCall(CheckTaintFn, {
@@ -336,7 +337,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                     Type::getVoidTy(C),
                     {Int32Ty, PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0)},
                     false);
-                Constant *CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
+                FunctionCallee CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
                 IRBuilder<> TaintIRB(&I);
                 TaintIRB.CreateCall(CheckTaintFn, {
                     ConstantInt::get(Int32Ty, cmp_id),
@@ -353,7 +354,8 @@ bool AFLCoverage::runOnModule(Module &M) {
                   Type::getVoidTy(C),
                   {PointerType::get(Int8Ty, 0), Int32Ty},
                   false);
-              Constant *TaintSourceFn = M.getOrInsertFunction("__afl_taint_source", TaintSourceTy);
+              FunctionCallee TaintSourceFn =
+                  M.getOrInsertFunction("__afl_taint_source", TaintSourceTy);
               
               IRBuilder<> TaintIRB(&I);
               TaintIRB.SetInsertPoint(&I);
@@ -378,7 +380,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                   Int32Ty,
                   {PointerType::get(Int8Ty, 0), Int32Ty},
                   false);
-              Constant *TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
+              FunctionCallee TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
               
               IRBuilder<> TaintIRB(&I);
               TaintIRB.SetInsertPoint(&I);
@@ -399,7 +401,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                   Type::getVoidTy(C),
                   {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
                   false);
-              Constant *TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
+              FunctionCallee TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
               
               TaintIRB.CreateCall(TaintStoreFn, {
                   TaintIRB.CreateBitCast(Load, PointerType::get(Int8Ty, 0)),
@@ -419,7 +421,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                   Int32Ty,
                   {PointerType::get(Int8Ty, 0), Int32Ty},
                   false);
-              Constant *TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
+              FunctionCallee TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
               
               IRBuilder<> TaintIRB(&I);
               Type *ValTy = Val->getType();
@@ -436,7 +438,7 @@ bool AFLCoverage::runOnModule(Module &M) {
                   Type::getVoidTy(C),
                   {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
                   false);
-              Constant *TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
+              FunctionCallee TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
               
               TaintIRB.CreateCall(TaintStoreFn, {
                   TaintIRB.CreateBitCast(Ptr, PointerType::get(Int8Ty, 0)),
@@ -461,14 +463,16 @@ bool AFLCoverage::runOnModule(Module &M) {
                     Int32Ty,
                     {PointerType::get(Int8Ty, 0), Int32Ty},
                     false);
-                Constant *TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
+                FunctionCallee TaintLoadFn =
+                    M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
                 
                 /* [修改] Int32Ty */
                 FunctionType *TaintPropTy = FunctionType::get(
                     Int32Ty,
                     {Int32Ty, Int32Ty},
                     false);
-                Constant *TaintPropFn = M.getOrInsertFunction("__afl_taint_propagate", TaintPropTy);
+                FunctionCallee TaintPropFn =
+                    M.getOrInsertFunction("__afl_taint_propagate", TaintPropTy);
                 
                 IRBuilder<> TaintIRB(&I);
                 TaintIRB.SetInsertPoint(&I);
@@ -499,7 +503,8 @@ bool AFLCoverage::runOnModule(Module &M) {
                     Type::getVoidTy(C),
                     {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
                     false);
-                Constant *TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
+                FunctionCallee TaintStoreFn =
+                    M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
                 
                 unsigned result_size = BO->getType()->getPrimitiveSizeInBits() / 8;
                 if (result_size == 0) result_size = 1;
