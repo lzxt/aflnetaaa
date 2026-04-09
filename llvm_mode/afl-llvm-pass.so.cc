@@ -13,6 +13,8 @@
 
 #include <set>
 #include <string>
+#include <functional>
+#include "llvm/ADT/DenseMap.h"
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Constants.h"
@@ -174,6 +176,30 @@ bool AFLCoverage::runOnModule(Module &M) {
       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
 
+  FunctionType *TaintLoadTy = FunctionType::get(
+      Int16Ty, {PointerType::get(Int8Ty, 0), Int32Ty}, false);
+  FunctionCallee TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
+
+  FunctionType *TaintStoreTy = FunctionType::get(
+      Type::getVoidTy(C),
+      {PointerType::get(Int8Ty, 0), Int32Ty, Int16Ty},
+      false);
+  FunctionCallee TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
+
+  FunctionType *TaintPropTy = FunctionType::get(
+      Int16Ty, {Int16Ty, Int16Ty}, false);
+  FunctionCallee TaintPropFn = M.getOrInsertFunction("__afl_taint_propagate", TaintPropTy);
+
+  FunctionType *CheckTaintTy = FunctionType::get(
+      Type::getVoidTy(C), {Int32Ty, Int16Ty, Int16Ty}, false);
+  FunctionCallee CheckTaintFn =
+      M.getOrInsertFunction("__afl_check_taint_with_tags", CheckTaintTy);
+
+  FunctionType *TaintSourceTy = FunctionType::get(
+      Type::getVoidTy(C), {PointerType::get(Int8Ty, 0), Int32Ty}, false);
+  FunctionCallee TaintSourceFn =
+      M.getOrInsertFunction("__afl_taint_source", TaintSourceTy);
+
   int inst_blocks = 0;
 
   if (auto_dict_enabled) {
@@ -236,64 +262,97 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       if (taint_enabled) {
 
+        DenseMap<Value*, Value*> value_tags;
+        std::function<Value*(Value*, IRBuilder<>&)> buildTagForValue;
+        buildTagForValue = [&](Value* V, IRBuilder<> &B) -> Value* {
+          if (!V) return ConstantInt::get(Int16Ty, 0);
+
+          DenseMap<Value*, Value*>::iterator it = value_tags.find(V);
+          if (it != value_tags.end()) return it->second;
+
+          if (isa<Constant>(V)) {
+            return ConstantInt::get(Int16Ty, 0);
+          }
+
+          if (auto *LI = dyn_cast<LoadInst>(V)) {
+            Value *Ptr = LI->getPointerOperand();
+            Type *LoadTy = LI->getType();
+            unsigned size = LoadTy->getPrimitiveSizeInBits() / 8;
+            if (!size) size = 1;
+            Value *Tag = B.CreateCall(TaintLoadFn, {
+                B.CreateBitCast(Ptr, PointerType::get(Int8Ty, 0)),
+                ConstantInt::get(Int32Ty, size)
+            });
+            value_tags[V] = Tag;
+            return Tag;
+          }
+
+          if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+            unsigned op = BO->getOpcode();
+            if (op == Instruction::Add || op == Instruction::Sub ||
+                op == Instruction::Mul || op == Instruction::And ||
+                op == Instruction::Or  || op == Instruction::Xor) {
+              Value *T1 = buildTagForValue(BO->getOperand(0), B);
+              Value *T2 = buildTagForValue(BO->getOperand(1), B);
+              Value *HasT1 = B.CreateICmpNE(T1, ConstantInt::get(Int16Ty, 0));
+              Value *HasT2 = B.CreateICmpNE(T2, ConstantInt::get(Int16Ty, 0));
+              Value *HasAny = B.CreateOr(HasT1, HasT2);
+              Value *PropTag = B.CreateCall(TaintPropFn, {T1, T2});
+              Value *Tag = B.CreateSelect(
+                  HasAny,
+                  PropTag,
+                  ConstantInt::get(Int16Ty, 0));
+              value_tags[V] = Tag;
+              return Tag;
+            }
+          }
+
+          if (auto *CI = dyn_cast<CastInst>(V)) {
+            return buildTagForValue(CI->getOperand(0), B);
+          }
+
+          if (V->getType()->isPointerTy()) {
+            Value *Tag = B.CreateCall(TaintLoadFn, {
+                B.CreateBitCast(V, PointerType::get(Int8Ty, 0)),
+                ConstantInt::get(Int32Ty, 1)
+            });
+            value_tags[V] = Tag;
+            return Tag;
+          }
+
+          return ConstantInt::get(Int16Ty, 0);
+        };
+
         for (auto &I : BB) {
 
           if (auto *ICmp = dyn_cast<ICmpInst>(&I)) {
-            
+
             bool is_candidate = false;
-            for (auto it = I.getIterator(); it != BB.end(); ++it) {
-              if (auto *Br = dyn_cast<BranchInst>(&*it)) {
-                if (Br->isConditional()) {
+            for (User *U : ICmp->users()) {
+              if (auto *Br = dyn_cast<BranchInst>(U)) {
+                if (Br->isConditional() && Br->getCondition() == ICmp) {
                   is_candidate = true;
                   break;
                 }
               }
             }
-            
+
             if (!is_candidate) continue;
-            
+
             unsigned int cmp_id = cmp_id_counter++;
             if (cmp_id >= 4096) continue;
-            
+
             Value *Op1 = ICmp->getOperand(0);
             Value *Op2 = ICmp->getOperand(1);
-            
-            FunctionType *CheckTaintTy = FunctionType::get(
-                Type::getVoidTy(C),
-                {Int32Ty, PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0)},
-                false);
-            
-            FunctionCallee CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
-            
-            IRBuilder<> TaintIRB(&I);
-            TaintIRB.SetInsertPoint(&I);
-            TaintIRB.SetInsertPoint(I.getNextNode());
-            
-            /* [修改] 使用 Int32Ty 作为返回值 */
-            FunctionType *GetTaintTy = FunctionType::get(
-                Int32Ty,  
-                {PointerType::get(Int8Ty, 0), Int32Ty},
-                false);
-            FunctionCallee GetTaintFn = M.getOrInsertFunction("__afl_taint_load", GetTaintTy);
-            
-            Value *Op1Tag = TaintIRB.CreateCall(GetTaintFn, {
-                TaintIRB.CreateBitCast(Op1, PointerType::get(Int8Ty, 0)),
-                ConstantInt::get(Int32Ty, Op1->getType()->getPrimitiveSizeInBits() / 8)
-            });
-            Value *Op2Tag = TaintIRB.CreateCall(GetTaintFn, {
-                TaintIRB.CreateBitCast(Op2, PointerType::get(Int8Ty, 0)),
-                ConstantInt::get(Int32Ty, Op2->getType()->getPrimitiveSizeInBits() / 8)
-            });
-            
-            /* [修改] 参数改为 Int32Ty */
-            FunctionType *CheckTaintWithTagsTy = FunctionType::get(
-                Type::getVoidTy(C),
-                {Int32Ty, Int32Ty, Int32Ty},
-                false);
-            FunctionCallee CheckTaintWithTagsFn =
-                M.getOrInsertFunction("__afl_check_taint_with_tags", CheckTaintWithTagsTy);
-            
-            TaintIRB.CreateCall(CheckTaintWithTagsFn, {
+
+            Instruction *Next = I.getNextNode();
+            if (!Next) continue;
+            IRBuilder<> TaintIRB(Next);
+
+            Value *Op1Tag = buildTagForValue(Op1, TaintIRB);
+            Value *Op2Tag = buildTagForValue(Op2, TaintIRB);
+
+            TaintIRB.CreateCall(CheckTaintFn, {
                 ConstantInt::get(Int32Ty, cmp_id),
                 Op1Tag,
                 Op2Tag
@@ -305,17 +364,12 @@ bool AFLCoverage::runOnModule(Module &M) {
             unsigned int cmp_id = cmp_id_counter++;
             if (cmp_id < 4096) {
               Value *Cond = Switch->getCondition();
-              FunctionType *CheckTaintTy = FunctionType::get(
-                  Type::getVoidTy(C),
-                  {Int32Ty, PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0)},
-                  false);
-              FunctionCallee CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
               IRBuilder<> TaintIRB(&I);
-              Value *CondPtr = TaintIRB.CreateBitCast(Cond, PointerType::get(Int8Ty, 0));
+              Value *CondTag = buildTagForValue(Cond, TaintIRB);
               TaintIRB.CreateCall(CheckTaintFn, {
                   ConstantInt::get(Int32Ty, cmp_id),
-                  CondPtr,
-                  ConstantPointerNull::get(PointerType::get(Int8Ty, 0))
+                  CondTag,
+                  ConstantInt::get(Int16Ty, 0)
               });
             }
           }
@@ -330,116 +384,93 @@ bool AFLCoverage::runOnModule(Module &M) {
                  FnName == "strncmp" || FnName == "strcasecmp" ||
                  FnName == "strncasecmp" || FnName == "bcmp") && 
                  Call->getNumArgOperands() >= 2) {
+
+              bool is_candidate = false;
+              for (User *U : Call->users()) {
+                if (auto *CmpUse = dyn_cast<ICmpInst>(U)) {
+                  for (User *CU : CmpUse->users()) {
+                    if (auto *Br = dyn_cast<BranchInst>(CU)) {
+                      if (Br->isConditional() && Br->getCondition() == CmpUse) {
+                        is_candidate = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (is_candidate) break;
+              }
+              if (!is_candidate) continue;
               
               unsigned int cmp_id = cmp_id_counter++;
               if (cmp_id < 4096) {
-                FunctionType *CheckTaintTy = FunctionType::get(
-                    Type::getVoidTy(C),
-                    {Int32Ty, PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0)},
-                    false);
-                FunctionCallee CheckTaintFn = M.getOrInsertFunction("__afl_check_taint", CheckTaintTy);
                 IRBuilder<> TaintIRB(&I);
+                Value *Arg1Tag = TaintIRB.CreateCall(TaintLoadFn, {
+                    TaintIRB.CreateBitCast(Call->getArgOperand(0), PointerType::get(Int8Ty, 0)),
+                    ConstantInt::get(Int32Ty, 1)
+                });
+                Value *Arg2Tag = TaintIRB.CreateCall(TaintLoadFn, {
+                    TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0)),
+                    ConstantInt::get(Int32Ty, 1)
+                });
                 TaintIRB.CreateCall(CheckTaintFn, {
                     ConstantInt::get(Int32Ty, cmp_id),
-                    TaintIRB.CreateBitCast(Call->getArgOperand(0), PointerType::get(Int8Ty, 0)),
-                    TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0))
+                    Arg1Tag,
+                    Arg2Tag
                 });
               }
             }
 
-            if (FnName == "recv" || FnName == "read" || FnName == "recvfrom" ||
-                FnName == "recvmsg" || FnName == "readv") {
-              
-              FunctionType *TaintSourceTy = FunctionType::get(
-                  Type::getVoidTy(C),
-                  {PointerType::get(Int8Ty, 0), Int32Ty},
-                  false);
-              FunctionCallee TaintSourceFn =
-                  M.getOrInsertFunction("__afl_taint_source", TaintSourceTy);
-              
-              IRBuilder<> TaintIRB(&I);
-              TaintIRB.SetInsertPoint(&I);
-              TaintIRB.SetInsertPoint(I.getNextNode());
-              
-              /* [修改] 兼容旧版 */
-              if (Call->getNumArgOperands() >= 2) {
-                Value *Buf = Call->getArgOperand(1);
-                Value *Len = Call->getArgOperand(2);
-                TaintIRB.CreateCall(TaintSourceFn, {
-                    TaintIRB.CreateBitCast(Buf, PointerType::get(Int8Ty, 0)),
-                    TaintIRB.CreateZExtOrTrunc(Len, Int32Ty)
-                });
+            if (FnName == "recv" || FnName == "read" || FnName == "recvfrom") {
+
+              Instruction *Next = I.getNextNode();
+              if (!Next) continue;
+              IRBuilder<> TaintIRB(Next);
+
+              Value *Buf = nullptr;
+              if (Call->getNumArgOperands() >= 3) {
+                Buf = Call->getArgOperand(1);
               }
+
+              if (!Buf) continue;
+
+              Value *Ret = Call;
+              if (!Ret->getType()->isIntegerTy()) continue;
+              Value *Ret32 = TaintIRB.CreateSExtOrTrunc(Ret, Int32Ty);
+              Value *HasInput = TaintIRB.CreateICmpSGT(Ret32, ConstantInt::get(Int32Ty, 0));
+              Value *SafeLen = TaintIRB.CreateSelect(
+                  HasInput, Ret32, ConstantInt::get(Int32Ty, 0));
+              TaintIRB.CreateCall(TaintSourceFn, {
+                  TaintIRB.CreateBitCast(Buf, PointerType::get(Int8Ty, 0)),
+                  SafeLen
+              });
             }
           }
 
           if (auto *Load = dyn_cast<LoadInst>(&I)) {
-            if (taint_enabled) {
-              /* [修改] Int32Ty */
-              FunctionType *TaintLoadTy = FunctionType::get(
-                  Int32Ty,
-                  {PointerType::get(Int8Ty, 0), Int32Ty},
-                  false);
-              FunctionCallee TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
-              
-              IRBuilder<> TaintIRB(&I);
-              TaintIRB.SetInsertPoint(&I);
-              TaintIRB.SetInsertPoint(I.getNextNode());
-              
-              Value *Ptr = Load->getPointerOperand();
-              Type *LoadTy = Load->getType();
-              unsigned size = LoadTy->getPrimitiveSizeInBits() / 8;
-              if (size == 0) size = 1;
-              
-              Value *Tag = TaintIRB.CreateCall(TaintLoadFn, {
-                  TaintIRB.CreateBitCast(Ptr, PointerType::get(Int8Ty, 0)),
-                  ConstantInt::get(Int32Ty, size)
-              });
-              
-              /* [修改] Int32Ty */
-              FunctionType *TaintStoreTy = FunctionType::get(
-                  Type::getVoidTy(C),
-                  {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
-                  false);
-              FunctionCallee TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
-              
-              TaintIRB.CreateCall(TaintStoreFn, {
-                  TaintIRB.CreateBitCast(Load, PointerType::get(Int8Ty, 0)),
-                  ConstantInt::get(Int32Ty, size),
-                  Tag
-              });
-            }
+            Instruction *Next = I.getNextNode();
+            if (!Next) continue;
+            IRBuilder<> TaintIRB(Next);
+            Value *Ptr = Load->getPointerOperand();
+            unsigned size = Load->getType()->getPrimitiveSizeInBits() / 8;
+            if (!size) size = 1;
+            Value *Tag = TaintIRB.CreateCall(TaintLoadFn, {
+                TaintIRB.CreateBitCast(Ptr, PointerType::get(Int8Ty, 0)),
+                ConstantInt::get(Int32Ty, size)
+            });
+            value_tags[Load] = Tag;
           }
 
           if (auto *Store = dyn_cast<StoreInst>(&I)) {
             if (taint_enabled) {
               Value *Val = Store->getValueOperand();
               Value *Ptr = Store->getPointerOperand();
-              
-              /* [修改] Int32Ty */
-              FunctionType *TaintLoadTy = FunctionType::get(
-                  Int32Ty,
-                  {PointerType::get(Int8Ty, 0), Int32Ty},
-                  false);
-              FunctionCallee TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
-              
+
               IRBuilder<> TaintIRB(&I);
               Type *ValTy = Val->getType();
               unsigned size = ValTy->getPrimitiveSizeInBits() / 8;
               if (size == 0) size = 1;
-              
-              Value *Tag = TaintIRB.CreateCall(TaintLoadFn, {
-                  TaintIRB.CreateBitCast(Val, PointerType::get(Int8Ty, 0)),
-                  ConstantInt::get(Int32Ty, size)
-              });
-              
-              /* [修改] Int32Ty */
-              FunctionType *TaintStoreTy = FunctionType::get(
-                  Type::getVoidTy(C),
-                  {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
-                  false);
-              FunctionCallee TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
-              
+
+              Value *Tag = buildTagForValue(Val, TaintIRB);
               TaintIRB.CreateCall(TaintStoreFn, {
                   TaintIRB.CreateBitCast(Ptr, PointerType::get(Int8Ty, 0)),
                   ConstantInt::get(Int32Ty, size),
@@ -448,73 +479,23 @@ bool AFLCoverage::runOnModule(Module &M) {
             }
           }
 
-          if (taint_enabled) {
-            if (isa<BinaryOperator>(&I)) {
-              BinaryOperator *BO = cast<BinaryOperator>(&I);
-              if (BO->getOpcode() == Instruction::Add ||
-                  BO->getOpcode() == Instruction::Sub ||
-                  BO->getOpcode() == Instruction::Mul ||
-                  BO->getOpcode() == Instruction::And ||
-                  BO->getOpcode() == Instruction::Or ||
-                  BO->getOpcode() == Instruction::Xor) {
-                
-                /* [修改] Int32Ty */
-                FunctionType *TaintLoadTy = FunctionType::get(
-                    Int32Ty,
-                    {PointerType::get(Int8Ty, 0), Int32Ty},
-                    false);
-                FunctionCallee TaintLoadFn =
-                    M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
-                
-                /* [修改] Int32Ty */
-                FunctionType *TaintPropTy = FunctionType::get(
-                    Int32Ty,
-                    {Int32Ty, Int32Ty},
-                    false);
-                FunctionCallee TaintPropFn =
-                    M.getOrInsertFunction("__afl_taint_propagate", TaintPropTy);
-                
-                IRBuilder<> TaintIRB(&I);
-                TaintIRB.SetInsertPoint(&I);
-                TaintIRB.SetInsertPoint(I.getNextNode());
-                
-                Value *Op1 = BO->getOperand(0);
-                Value *Op2 = BO->getOperand(1);
-                
-                unsigned size1 = Op1->getType()->getPrimitiveSizeInBits() / 8;
-                unsigned size2 = Op2->getType()->getPrimitiveSizeInBits() / 8;
-                if (size1 == 0) size1 = 1;
-                if (size2 == 0) size2 = 1;
-                
-                Value *Tag1 = TaintIRB.CreateCall(TaintLoadFn, {
-                    TaintIRB.CreateBitCast(Op1, PointerType::get(Int8Ty, 0)),
-                    ConstantInt::get(Int32Ty, size1)
-                });
-                
-                Value *Tag2 = TaintIRB.CreateCall(TaintLoadFn, {
-                    TaintIRB.CreateBitCast(Op2, PointerType::get(Int8Ty, 0)),
-                    ConstantInt::get(Int32Ty, size2)
-                });
-                
-                Value *ResultTag = TaintIRB.CreateCall(TaintPropFn, {Tag1, Tag2});
-                
-                /* [修改] Int32Ty */
-                FunctionType *TaintStoreTy = FunctionType::get(
-                    Type::getVoidTy(C),
-                    {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
-                    false);
-                FunctionCallee TaintStoreFn =
-                    M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
-                
-                unsigned result_size = BO->getType()->getPrimitiveSizeInBits() / 8;
-                if (result_size == 0) result_size = 1;
-                
-                TaintIRB.CreateCall(TaintStoreFn, {
-                    TaintIRB.CreateBitCast(BO, PointerType::get(Int8Ty, 0)),
-                    ConstantInt::get(Int32Ty, result_size),
-                    ResultTag
-                });
-              }
+          if (taint_enabled && isa<BinaryOperator>(&I)) {
+            BinaryOperator *BO = cast<BinaryOperator>(&I);
+            unsigned op = BO->getOpcode();
+            if (op == Instruction::Add || op == Instruction::Sub ||
+                op == Instruction::Mul || op == Instruction::And ||
+                op == Instruction::Or  || op == Instruction::Xor) {
+              Instruction *Next = I.getNextNode();
+              if (!Next) continue;
+              IRBuilder<> TaintIRB(Next);
+              Value *T1 = buildTagForValue(BO->getOperand(0), TaintIRB);
+              Value *T2 = buildTagForValue(BO->getOperand(1), TaintIRB);
+              Value *HasT1 = TaintIRB.CreateICmpNE(T1, ConstantInt::get(Int16Ty, 0));
+              Value *HasT2 = TaintIRB.CreateICmpNE(T2, ConstantInt::get(Int16Ty, 0));
+              Value *HasAny = TaintIRB.CreateOr(HasT1, HasT2);
+              Value *PropTag = TaintIRB.CreateCall(TaintPropFn, {T1, T2});
+              value_tags[BO] = TaintIRB.CreateSelect(
+                  HasAny, PropTag, ConstantInt::get(Int16Ty, 0));
             }
           }
 

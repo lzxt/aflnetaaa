@@ -23,12 +23,14 @@
 #define MAX_CMP_ID 4096
 #endif
 
-/* [修改] Taint tag: 32-bit value to support file sizes > 64KB */
-typedef u32 taint_tag_t;
+/* 16-bit taint tag, value = input_offset + 1 */
+typedef u16 taint_tag_t;
+#define TAINT_MAX_OFFSET 65534u
 
 /* Taint map: bitmap for each CMP_ID, tracking which input bytes influenced it */
 static u8* __afl_taint_map = NULL;
 static u32 __afl_taint_map_size = 0;
+static u8* __afl_cmp_hit_map = NULL; /* Per-run CMP hit bitmap */
 
 /* Current input buffer and size */
 static u8* __afl_input_buf = NULL;
@@ -48,7 +50,7 @@ static void __afl_init_shadow_mem(void) {
 /* Convert pointer to shadow memory index */
 static inline u32 __afl_ptr_to_shadow_idx(void* ptr) {
   u64 addr = (u64)ptr;
-  return (addr >> 3) % (SHADOW_MEM_SIZE / sizeof(taint_tag_t));
+  return (u32)(addr % (SHADOW_MEM_SIZE / sizeof(taint_tag_t)));
 }
 
 /* Initialize taint map from shared memory */
@@ -67,6 +69,15 @@ __attribute__((constructor)) void __afl_taint_init(void) {
   if (__afl_taint_map == (void*)-1) {
     __afl_taint_map = NULL;
     __afl_taint_map_size = 0;
+  }
+
+  id_str = getenv("__AFL_CMP_HIT_SHM_ID");
+  if (id_str) {
+    s32 cmp_shm_id = atoi(id_str);
+    if (cmp_shm_id >= 0) {
+      __afl_cmp_hit_map = (u8*)shmat(cmp_shm_id, NULL, 0);
+      if (__afl_cmp_hit_map == (void*)-1) __afl_cmp_hit_map = NULL;
+    }
   }
 
 }
@@ -91,19 +102,10 @@ static inline void __afl_mark_taint_offset(u32 cmp_id, u32 offset) {
 
 }
 
-/* Extract taint tags from a value */
-static inline taint_tag_t __afl_get_taint_tag(void* val_ptr) {
-  if (!__afl_shadow_mem) __afl_init_shadow_mem();
-  if (!__afl_shadow_mem || !val_ptr) return 0;
-  
-  u32 idx = __afl_ptr_to_shadow_idx(val_ptr);
-  return __afl_shadow_mem[idx];
-}
-
-/* Propagate taint through operations */
+/* Propagate taint through operations (lightweight) */
 taint_tag_t __afl_taint_propagate(taint_tag_t tag1, taint_tag_t tag2) {
-  /* Union of taint tags */
-  return tag1 | tag2;
+  if (tag1) return tag1;
+  return tag2;
 }
 
 /* Mark input bytes as tainted after recv/read */
@@ -113,63 +115,57 @@ void __afl_taint_source(u8* buf, u32 len) {
   if (!__afl_shadow_mem) __afl_init_shadow_mem();
   if (!__afl_shadow_mem || !buf) return;
   
-  /* 为每个字节分配 32-bit 标签（偏移量） */
+  /* 为每个字节分配 16-bit 标签（偏移量+1） */
   for (u32 i = 0; i < len && i < MAX_FILE; i++) {
+    if (i > TAINT_MAX_OFFSET) break;
     u32 idx = __afl_ptr_to_shadow_idx(&buf[i]);
     __afl_shadow_mem[idx] = (taint_tag_t)(i + 1);  /* +1 to avoid 0 (untainted) */
   }
 }
 
 /* Check taint at CMP and record in map */
-void __afl_check_taint(u32 cmp_id, void* val1_ptr, void* val2_ptr) {
+void __afl_check_taint(u32 cmp_id, taint_tag_t tag1, taint_tag_t tag2) {
   
   if (!__afl_taint_map || cmp_id >= MAX_CMP_ID) return;
-  
-  taint_tag_t tag1 = __afl_get_taint_tag(val1_ptr);
-  taint_tag_t tag2 = __afl_get_taint_tag(val2_ptr);
-  
+
+  if (__afl_cmp_hit_map) __afl_cmp_hit_map[cmp_id] = 1;
+
   taint_tag_t combined = __afl_taint_propagate(tag1, tag2);
   
   /* Record offsets that influenced this CMP */
   if (combined != 0) {
     /* Tag is offset+1, so extract offset */
-    if (tag1 > 0 && tag1 <= MAX_FILE) {
+    if (tag1 > 0 && tag1 <= (TAINT_MAX_OFFSET + 1)) {
       __afl_mark_taint_offset(cmp_id, tag1 - 1);
     }
-    if (tag2 > 0 && tag2 <= MAX_FILE) {
+    if (tag2 > 0 && tag2 <= (TAINT_MAX_OFFSET + 1)) {
       __afl_mark_taint_offset(cmp_id, tag2 - 1);
     }
   }
 
 }
 
-/* Check taint at CMP with tags (new API) */
+/* Compatibility API used by stage-2 sink trigger path */
 void __afl_check_taint_with_tags(u32 cmp_id, taint_tag_t tag1, taint_tag_t tag2) {
-  
-  if (!__afl_taint_map || cmp_id >= MAX_CMP_ID) return;
-  
-  taint_tag_t combined = __afl_taint_propagate(tag1, tag2);
-  
-  /* Record offsets that influenced this CMP */
-  if (combined != 0) {
-    if (tag1 > 0 && tag1 <= MAX_FILE) {
-      __afl_mark_taint_offset(cmp_id, tag1 - 1);
-    }
-    if (tag2 > 0 && tag2 <= MAX_FILE) {
-      __afl_mark_taint_offset(cmp_id, tag2 - 1);
-    }
-  }
-
+  __afl_check_taint(cmp_id, tag1, tag2);
 }
 
 /* Load taint tag (called by instrumentation) */
 taint_tag_t __afl_taint_load(void* ptr, u32 size) {
   if (!__afl_shadow_mem) __afl_init_shadow_mem();
   if (!__afl_shadow_mem || !ptr) return 0;
-  
-  /* Return the tag for the first byte (simplified) */
-  u32 idx = __afl_ptr_to_shadow_idx(ptr);
-  return __afl_shadow_mem[idx];
+
+  if (!size) size = 1;
+  taint_tag_t tag = 0;
+  for (u32 i = 0; i < size; i++) {
+    u32 idx = __afl_ptr_to_shadow_idx((u8*)ptr + i);
+    taint_tag_t cur = __afl_shadow_mem[idx];
+    if (cur) {
+      tag = cur;
+      break;
+    }
+  }
+  return tag;
 }
 
 /* Store taint tag (called by instrumentation) */
