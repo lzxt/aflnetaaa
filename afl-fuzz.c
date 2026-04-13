@@ -177,6 +177,7 @@ static s32 taint_map_shm_id = -1;  /* SHM ID for taint map */
 static u8* cmp_hit_shm = NULL;     /* Per-run CMP hit bitmap */
 static s32 cmp_hit_shm_id = -1;    /* SHM ID for cmp hit bitmap */
 static u8* cmp_seen_global = NULL; /* Global seen CMP set */
+static u8* cmp_frontier_global = NULL; /* CMPs still treated as frontier */
 static u32 taint_cmp_count = 0;    /* Number of CMPs instrumented */
 static u64 last_new_edge_time = 0;  /* Timestamp of last new edge discovery */
 static u8 df_interesting_seed = 0;   /* Current seed is DF interesting? */
@@ -197,6 +198,18 @@ static inline void update_cmp_seen_from_run(void) {
   if (!cmp_hit_shm || !cmp_seen_global) return;
   for (u32 i = 0; i < MAX_CMP_ID; i++) {
     if (cmp_hit_shm[i]) cmp_seen_global[i] = 1;
+  }
+}
+
+static inline u8 cmp_is_frontier(u32 cmp_id) {
+  if (!cmp_frontier_global || cmp_id >= MAX_CMP_ID) return 0;
+  return cmp_frontier_global[cmp_id];
+}
+
+static inline void consume_frontier_cmps_from_run(u8* cmp_new_df) {
+  if (!cmp_frontier_global || !cmp_hit_shm || !cmp_new_df) return;
+  for (u32 i = 0; i < MAX_CMP_ID; i++) {
+    if (cmp_hit_shm[i] && cmp_new_df[i]) cmp_frontier_global[i] = 0;
   }
 }
 
@@ -333,6 +346,10 @@ struct queue_entry {
   u16 df_new_cmp_cnt;                 /* New CMPs with new DF feedback     */
   u16 df_total_cmp_cnt;               /* Total tainted CMPs in this run    */
   u16 df_density_pm;                  /* Nnew_df / Ntotal_cmp in permille  */
+  u16 df_frontier_cmp_cnt;            /* Frontier CMPs affected this run   */
+  u16 df_focus_pm;                    /* Focused bytes / input len permille*/
+  u32 df_min_offset;                  /* Minimum focused offset            */
+  u32 df_max_offset;                  /* Maximum focused offset            */
   u32 *df_key_offsets;                /* Focused offsets for DF mutation   */
   u32 df_key_count;                   /* Number of focused offsets         */
 
@@ -1718,6 +1735,13 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->df_new_cmp_cnt = 0;
   q->df_total_cmp_cnt = 0;
   q->df_density_pm = 0;
+  q->df_frontier_cmp_cnt = 0;
+  q->df_focus_pm = 0;
+  q->df_min_offset = 0;
+  q->df_max_offset = 0;
+  q->df_key_offsets = NULL;
+  q->df_key_count = 0;
+  q->df_density_pm = 0;
   q->df_key_offsets = NULL;
   q->df_key_count = 0;
 
@@ -2203,6 +2227,11 @@ static void remove_shm(void) {
     cmp_seen_global = NULL;
   }
 
+  if (cmp_frontier_global) {
+    ck_free(cmp_frontier_global);
+    cmp_frontier_global = NULL;
+  }
+
 }
 
 
@@ -2412,6 +2441,8 @@ EXP_ST void setup_shm(void) {
     memset(cmp_hit_shm, 0, MAX_CMP_ID);
     cmp_seen_global = ck_alloc(MAX_CMP_ID);
     memset(cmp_seen_global, 0, MAX_CMP_ID);
+    cmp_frontier_global = ck_alloc(MAX_CMP_ID);
+    memset(cmp_frontier_global, 1, MAX_CMP_ID);
     
     /* Allocate previous taint map for comparison */
     prev_taint_map = ck_alloc(taint_map_size);
@@ -4258,11 +4289,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         }
         
         if (df_change && cmp_triggered) {
-          /* Stronger frontier check: new DF on CMPs never seen before. */
+          /* Frontier-aware check: only new DF on still-frontier CMPs is valuable. */
           u32 frontier_new_cmp = 0;
-          if (cmp_hit_shm && cmp_seen_global) {
+          if (cmp_hit_shm && cmp_frontier_global) {
             for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
-              if (cmp_has_new_df[cid] && cmp_hit_shm[cid] && !cmp_seen_global[cid]) {
+              if (cmp_has_new_df[cid] && cmp_hit_shm[cid] && cmp_is_frontier(cid)) {
                 frontier_new_cmp++;
               }
             }
@@ -4276,13 +4307,22 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
             fn = alloc_printf("%s/queue/id:%06u,df_interesting", out_dir, queued_paths);
             u32 full_len = save_kl_messages_to_file(kl_messages, fn, 0, messages_sent);
             add_to_queue(fn, full_len, 0);
+            if (state_aware_mode) {
+              update_state_aware_variables(queue_top, 0);
+              last_protocol_state_new = 1;
+            }
             if (queue_top) {
               queue_top->df_interesting = 1;
-              queue_top->seed_class = SEED_CLASS_DF_EXPANDER;
+              queue_top->seed_class = last_protocol_state_new ?
+                SEED_CLASS_PROTOCOL_STATE_NEW : SEED_CLASS_DF_EXPANDER;
               queue_top->df_new_cmp_cnt = (u16)MIN(new_df_cmp, 65535);
               queue_top->df_total_cmp_cnt = (u16)MIN(total_cmp_tainted, 65535);
+              queue_top->df_frontier_cmp_cnt = (u16)MIN(frontier_new_cmp, 65535);
               queue_top->df_density_pm = (queue_top->df_total_cmp_cnt == 0) ? 0 :
                 (u16)((1000u * queue_top->df_new_cmp_cnt) / queue_top->df_total_cmp_cnt);
+              queue_top->df_focus_pm = 0;
+              queue_top->df_min_offset = 0;
+              queue_top->df_max_offset = 0;
 
               /* Persist focused DF offsets for strong directed mutation. */
               u32 max_off = MIN((u32)full_len, (u32)MAX_FILE);
@@ -4293,7 +4333,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
                 u32 cmp_span = (MAX_FILE / 8);
 
                 for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
-                  if (!cmp_has_new_df[cid]) continue;
+                  if (!cmp_has_new_df[cid] || !cmp_is_frontier(cid)) continue;
                   u8 *cmp_map = taint_map_shm + cid * cmp_span;
                   for (u32 off = 0; off < max_off; off++) {
                     u32 byte_idx = off >> 3;
@@ -4309,13 +4349,24 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
                   queue_top->df_key_offsets = ck_alloc(sizeof(u32) * key_count);
                   queue_top->df_key_count = key_count;
                   u32 k = 0;
+                  u32 min_off = max_off;
+                  u32 max_seen_off = 0;
                   for (u32 off = 0; off < max_off; off++) {
-                    if (key_bitmap[off]) queue_top->df_key_offsets[k++] = off;
+                    if (key_bitmap[off]) {
+                      queue_top->df_key_offsets[k++] = off;
+                      if (off < min_off) min_off = off;
+                      if (off > max_seen_off) max_seen_off = off;
+                    }
                   }
+                  queue_top->df_min_offset = (key_count > 0) ? min_off : 0;
+                  queue_top->df_max_offset = (key_count > 0) ? max_seen_off : 0;
+                  queue_top->df_focus_pm = (full_len == 0) ? 0 :
+                    (u16)MIN(1000u, (1000u * key_count) / full_len);
                 }
                 ck_free(key_bitmap);
               }
             }
+            consume_frontier_cmps_from_run(cmp_has_new_df);
             if (prev_taint_map) {
               memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
             }
@@ -4346,6 +4397,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
       }
       update_cmp_seen_from_run();
+      if (cmp_frontier_global) {
+        for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
+          if (cmp_hit_shm && cmp_hit_shm[cid]) cmp_frontier_global[cid] = 0;
+        }
+      }
     }
     
     /* Reset execs_wo_new_paths when new path is found */
@@ -4381,6 +4437,10 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       queue_top->df_new_cmp_cnt = 0;
       queue_top->df_total_cmp_cnt = 0;
       queue_top->df_density_pm = 0;
+      queue_top->df_frontier_cmp_cnt = 0;
+      queue_top->df_focus_pm = 0;
+      queue_top->df_min_offset = 0;
+      queue_top->df_max_offset = 0;
       queue_top->df_key_offsets = NULL;
       queue_top->df_key_count = 0;
     }
@@ -6010,11 +6070,21 @@ static u32 calculate_score(struct queue_entry* q) {
       perf_score = (perf_score * coef) / 100;
     }
 
+    if (q->df_frontier_cmp_cnt > 0) {
+      u32 frontier_bonus = 110 + MIN((u32)q->df_frontier_cmp_cnt * 10, 60u);
+      perf_score = (perf_score * frontier_bonus) / 100;
+    }
+
     if (q->df_interesting && q->df_key_count > 0) {
       /* Strong guidance: fewer focused bytes => higher mutation payoff. */
       u32 focus_bonus = (q->df_key_count <= 64) ? 150 :
                         (q->df_key_count <= 256) ? 125 : 110;
       perf_score = (perf_score * focus_bonus) / 100;
+    }
+
+    if (q->df_focus_pm > 0 && q->df_focus_pm <= 250) {
+      /* Compact semantic region: mutation is likely to be high-yield. */
+      perf_score = (perf_score * 120) / 100;
     }
 
     /* Heating: if no new edge in 30min, prioritize DF seeds (~80% time). */
