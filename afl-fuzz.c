@@ -176,12 +176,14 @@ static u8* taint_map_shm = NULL;  /* Shared memory for taint mapping */
 static s32 taint_map_shm_id = -1;  /* SHM ID for taint map */
 static u8* cmp_hit_shm = NULL;     /* Per-run CMP hit bitmap */
 static s32 cmp_hit_shm_id = -1;    /* SHM ID for cmp hit bitmap */
+static u32* active_cmp_ids_shm = NULL; /* [0]=count, [1..]=active cmp ids */
+static s32 active_cmp_ids_shm_id = -1; /* SHM ID for active cmp list */
 static u8* cmp_seen_global = NULL; /* Global seen CMP set */
 static u8* cmp_frontier_global = NULL; /* CMPs still treated as frontier */
 static u32 taint_cmp_count = 0;    /* Number of CMPs instrumented */
 static u64 last_new_edge_time = 0;  /* Timestamp of last new edge discovery */
 static u8 df_interesting_seed = 0;   /* Current seed is DF interesting? */
-static u8* prev_taint_map = NULL;    /* Previous taint map for comparison */
+static u8* prev_taint_map = NULL;    /* Global seen DF map for comparison */
 static u8 df_heating_mode = 0;       /* Heating mode for DF expander seeds */
 static u8 last_protocol_state_new = 0; /* Last execution discovered new protocol state */
 
@@ -2216,6 +2218,10 @@ static void remove_shm(void) {
   if (cmp_hit_shm_id >= 0) {
     shmctl(cmp_hit_shm_id, IPC_RMID, NULL);
   }
+
+  if (active_cmp_ids_shm_id >= 0) {
+    shmctl(active_cmp_ids_shm_id, IPC_RMID, NULL);
+  }
   
   if (prev_taint_map) {
     ck_free(prev_taint_map);
@@ -2413,6 +2419,7 @@ EXP_ST void setup_shm(void) {
     
     u8* taint_shm_str;
     u8* cmp_hit_shm_str;
+    u8* active_cmp_shm_str;
     u32 taint_map_size = TAINT_MAP_SIZE;
     
     /* Set environment variable to enable taint analysis in LLVM pass */
@@ -2439,6 +2446,16 @@ EXP_ST void setup_shm(void) {
     cmp_hit_shm = shmat(cmp_hit_shm_id, NULL, 0);
     if (cmp_hit_shm == (void*)-1) PFATAL("shmat() failed for cmp hit map");
     memset(cmp_hit_shm, 0, MAX_CMP_ID);
+
+    active_cmp_ids_shm_id = shmget(IPC_PRIVATE, sizeof(u32) * (MAX_CMP_ID + 1), IPC_CREAT | IPC_EXCL | 0600);
+    if (active_cmp_ids_shm_id < 0) PFATAL("shmget() failed for active cmp list");
+    active_cmp_shm_str = alloc_printf("%d", active_cmp_ids_shm_id);
+    setenv("__AFL_ACTIVE_CMP_SHM_ID", active_cmp_shm_str, 1);
+    ck_free(active_cmp_shm_str);
+    active_cmp_ids_shm = shmat(active_cmp_ids_shm_id, NULL, 0);
+    if (active_cmp_ids_shm == (void*)-1) PFATAL("shmat() failed for active cmp list");
+    memset(active_cmp_ids_shm, 0, sizeof(u32) * (MAX_CMP_ID + 1));
+
     cmp_seen_global = ck_alloc(MAX_CMP_ID);
     memset(cmp_seen_global, 0, MAX_CMP_ID);
     cmp_frontier_global = ck_alloc(MAX_CMP_ID);
@@ -3405,6 +3422,9 @@ static u8 run_target(char** argv, u32 timeout) {
   if (taint_analysis_enabled && cmp_hit_shm) {
     memset(cmp_hit_shm, 0, MAX_CMP_ID);
   }
+  if (taint_analysis_enabled && active_cmp_ids_shm) {
+    memset(active_cmp_ids_shm, 0, sizeof(u32) * (MAX_CMP_ID + 1));
+  }
   
   MEM_BARRIER();
 
@@ -4256,10 +4276,13 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         u8 cmp_has_new_df[MAX_CMP_ID];
         memset(cmp_has_new_df, 0, sizeof(cmp_has_new_df));
         
-        /* Compare current taint map with previous (single pass) */
+        /* Compare current taint map with globally seen DF map (single pass) */
         if (prev_taint_map) {
           u32 cmp_span = (MAX_FILE / 8);
-          for (u32 cmp_id = 0; cmp_id < MAX_CMP_ID; cmp_id++) {
+          for (u32 idx = 0; idx < MAX_CMP_ID; idx++) {
+            u32 cmp_id = (active_cmp_ids_shm && idx < active_cmp_ids_shm[0]) ? active_cmp_ids_shm[idx + 1] : MAX_CMP_ID;
+            if (cmp_id >= MAX_CMP_ID) break;
+            if (cmp_hit_shm && !cmp_hit_shm[cmp_id]) continue;
             u8 cmp_has_taint = 0;
             u8 cmp_new_this = 0;
             u32 base = cmp_id * cmp_span;
@@ -4280,7 +4303,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
             if (cmp_new_this) new_df_cmp++;
           }
         } else {
-          /* First run: allocate prev_taint_map */
+          /* First run: allocate global DF seen map */
           prev_taint_map = ck_alloc(TAINT_MAP_SIZE);
           if (prev_taint_map) {
             memset(prev_taint_map, 0, TAINT_MAP_SIZE);
@@ -4292,7 +4315,10 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
           /* Frontier-aware check: only new DF on still-frontier CMPs is valuable. */
           u32 frontier_new_cmp = 0;
           if (cmp_hit_shm && cmp_frontier_global) {
-            for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
+            u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
+            for (u32 idx = 0; idx < active_cmp_count; idx++) {
+              u32 cid = active_cmp_ids_shm[idx + 1];
+              if (cid >= MAX_CMP_ID) continue;
               if (cmp_has_new_df[cid] && cmp_hit_shm[cid] && cmp_is_frontier(cid)) {
                 frontier_new_cmp++;
               }
@@ -4327,55 +4353,101 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
               /* Persist focused DF offsets for strong directed mutation. */
               u32 max_off = MIN((u32)full_len, (u32)MAX_FILE);
               if (max_off > 0) {
-                u8 *key_bitmap = ck_alloc(max_off);
-                memset(key_bitmap, 0, max_off);
+                u16 *key_scores = ck_alloc(max_off * sizeof(u16));
+                memset(key_scores, 0, max_off * sizeof(u16));
                 u32 key_count = 0;
                 u32 cmp_span = (MAX_FILE / 8);
 
-                for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
+                u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
+                for (u32 idx = 0; idx < active_cmp_count; idx++) {
+                  u32 cid = active_cmp_ids_shm[idx + 1];
+                  if (cid >= MAX_CMP_ID) continue;
                   if (!cmp_has_new_df[cid] || !cmp_is_frontier(cid)) continue;
                   u8 *cmp_map = taint_map_shm + cid * cmp_span;
                   for (u32 off = 0; off < max_off; off++) {
                     u32 byte_idx = off >> 3;
                     u32 bit_idx  = off & 7;
-                    if ((cmp_map[byte_idx] & (1 << bit_idx)) && !key_bitmap[off]) {
-                      key_bitmap[off] = 1;
-                      key_count++;
+                    if (cmp_map[byte_idx] & (1 << bit_idx)) {
+                      if (!key_scores[off]) key_count++;
+                      if (key_scores[off] < 65535) key_scores[off]++;
                     }
                   }
                 }
 
                 if (key_count > 0) {
-                  queue_top->df_key_offsets = ck_alloc(sizeof(u32) * key_count);
-                  queue_top->df_key_count = key_count;
-                  u32 k = 0;
-                  u32 min_off = max_off;
-                  u32 max_seen_off = 0;
+                  u32 ranked_count = MIN(key_count, 128u);
+                  u32 top_offsets[128];
+                  u16 top_scores[128];
+                  u32 top_count = 0;
+
                   for (u32 off = 0; off < max_off; off++) {
-                    if (key_bitmap[off]) {
-                      queue_top->df_key_offsets[k++] = off;
-                      if (off < min_off) min_off = off;
-                      if (off > max_seen_off) max_seen_off = off;
+                    u16 score = key_scores[off];
+                    if (!score) continue;
+
+                    u32 pos = top_count;
+                    while (pos > 0) {
+                      u32 prev = pos - 1;
+                      if (top_scores[prev] > score) break;
+                      if (top_scores[prev] == score && top_offsets[prev] < off) break;
+                      if (pos < ranked_count) {
+                        top_scores[pos] = top_scores[prev];
+                        top_offsets[pos] = top_offsets[prev];
+                      }
+                      pos--;
+                    }
+
+                    if (pos < ranked_count) {
+                      top_scores[pos] = score;
+                      top_offsets[pos] = off;
+                      if (top_count < ranked_count) top_count++;
                     }
                   }
-                  queue_top->df_min_offset = (key_count > 0) ? min_off : 0;
-                  queue_top->df_max_offset = (key_count > 0) ? max_seen_off : 0;
+
+                  queue_top->df_key_offsets = ck_alloc(sizeof(u32) * top_count);
+                  queue_top->df_key_count = top_count;
+                  u32 min_off = max_off;
+                  u32 max_seen_off = 0;
+                  for (u32 k = 0; k < top_count; k++) {
+                    queue_top->df_key_offsets[k] = top_offsets[k];
+                    if (top_offsets[k] < min_off) min_off = top_offsets[k];
+                    if (top_offsets[k] > max_seen_off) max_seen_off = top_offsets[k];
+                  }
+                  queue_top->df_min_offset = (top_count > 0) ? min_off : 0;
+                  queue_top->df_max_offset = (top_count > 0) ? max_seen_off : 0;
                   queue_top->df_focus_pm = (full_len == 0) ? 0 :
-                    (u16)MIN(1000u, (1000u * key_count) / full_len);
+                    (u16)MIN(1000u, (1000u * top_count) / full_len);
                 }
-                ck_free(key_bitmap);
+                ck_free(key_scores);
               }
             }
             consume_frontier_cmps_from_run(cmp_has_new_df);
             if (prev_taint_map) {
-              memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
+              u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
+              for (u32 idx = 0; idx < active_cmp_count; idx++) {
+                u32 cmp_id = active_cmp_ids_shm[idx + 1];
+                if (cmp_id >= MAX_CMP_ID) continue;
+                if (!cmp_has_new_df[cmp_id]) continue;
+                u32 base = cmp_id * (MAX_FILE / 8);
+                for (u32 i = 0; i < (MAX_FILE / 8); i++) {
+                  prev_taint_map[base + i] |= taint_map_shm[base + i];
+                }
+              }
             }
             return 1;
           }
           
-          /* 即使不通向未覆盖区域，也更新 prev_taint_map */
+          /* Update globally seen DF bits even if not promoted to a DF seed. */
           if (prev_taint_map) {
-            memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
+            u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
+            for (u32 idx = 0; idx < active_cmp_count; idx++) {
+              u32 cmp_id = active_cmp_ids_shm[idx + 1];
+              if (cmp_id >= MAX_CMP_ID) continue;
+              if (!cmp_has_new_df[cmp_id]) continue;
+              u32 base = cmp_id * (MAX_FILE / 8);
+              for (u32 i = 0; i < (MAX_FILE / 8); i++) {
+                prev_taint_map[base + i] |= taint_map_shm[base + i];
+              }
+            }
           }
         }
         
@@ -4393,9 +4465,6 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       df_interesting_seed = 0;
       last_new_edge_time = get_cur_time();
       df_heating_mode = 0; /* Cooling: return budget to CF discovery */
-      if (prev_taint_map) {
-        memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
-      }
       update_cmp_seen_from_run();
       if (cmp_frontier_global) {
         for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
@@ -6096,11 +6165,11 @@ static u32 calculate_score(struct queue_entry* q) {
     if (df_heating_mode) {
       if (q->df_interesting) {
         /* Potential from DF density; keep in reasonable range. */
-        u32 hot_boost = 180 + ((u32)q->df_density_pm / 10); /* 1.8x .. 2.8x */
+        u32 hot_boost = 140 + ((u32)q->df_density_pm / 20); /* 1.4x .. 1.9x */
         perf_score = (perf_score * hot_boost) / 100;
       } else {
-        /* Cool non-DF seeds to leave ~80% time to DF hot seeds. */
-        perf_score = (perf_score * 20) / 100;
+        /* Keep baseline exploration alive; avoid starving AFLNet core loop. */
+        perf_score = (perf_score * 70) / 100;
       }
     }
   }
@@ -7477,43 +7546,92 @@ skip_extras:
       if (run_target(argv, exec_tmout) == FAULT_ERROR) goto abandon_entry;
       memcpy(out_buf, in_buf, len);
 
-      u8* key_bitmap = ck_alloc(len ? len : 1);
-      memset(key_bitmap, 0, len);
+      u16* key_scores = ck_alloc((len ? len : 1) * sizeof(u16));
+      memset(key_scores, 0, (len ? len : 1) * sizeof(u16));
+      u32 max_off = MIN((u32)len, (u32)MAX_FILE);
 
-      for (u32 cmp_id = 0; cmp_id < MAX_CMP_ID; cmp_id++) {
-        u8* cmp_map = taint_map_shm + cmp_id * (MAX_FILE / 8);
-        u32 max_off = MIN((u32)len, (u32)MAX_FILE);
-
-        for (u32 offset = 0; offset < max_off; offset++) {
-          u32 byte_idx = offset >> 3;
-          u32 bit_idx  = offset & 7;
-          if ((cmp_map[byte_idx] & (1 << bit_idx)) && !key_bitmap[offset]) {
-            key_bitmap[offset] = 1;
-            key_count++;
+      if (active_cmp_ids_shm && active_cmp_ids_shm[0] > 0) {
+        u32 active_cmp_count = active_cmp_ids_shm[0];
+        for (u32 idx = 0; idx < active_cmp_count; idx++) {
+          u32 cmp_id = active_cmp_ids_shm[idx + 1];
+          if (cmp_id >= MAX_CMP_ID) continue;
+          if (cmp_frontier_global && !cmp_is_frontier(cmp_id)) continue;
+          u8* cmp_map = taint_map_shm + cmp_id * (MAX_FILE / 8);
+          for (u32 offset = 0; offset < max_off; offset++) {
+            u32 byte_idx = offset >> 3;
+            u32 bit_idx  = offset & 7;
+            if (cmp_map[byte_idx] & (1 << bit_idx)) {
+              if (key_scores[offset] < 65535) key_scores[offset]++;
+            }
+          }
+        }
+      } else {
+        for (u32 cmp_id = 0; cmp_id < MAX_CMP_ID; cmp_id++) {
+          u8* cmp_map = taint_map_shm + cmp_id * (MAX_FILE / 8);
+          for (u32 offset = 0; offset < max_off; offset++) {
+            u32 byte_idx = offset >> 3;
+            u32 bit_idx  = offset & 7;
+            if (cmp_map[byte_idx] & (1 << bit_idx)) {
+              if (key_scores[offset] < 65535) key_scores[offset]++;
+            }
           }
         }
       }
 
-      if (key_count > 0) {
-        key_offsets = ck_alloc(sizeof(u32) * key_count);
-        u32 k = 0;
-        for (u32 i = 0; i < len && k < key_count; i++) {
-          if (key_bitmap[i]) key_offsets[k++] = i;
-        }
+      for (u32 offset = 0; offset < max_off; offset++) {
+        if (key_scores[offset]) key_count++;
       }
-      ck_free(key_bitmap);
+
+      if (key_count > 0) {
+        u32 ranked_count = MIN(key_count, 128u);
+        u32* ranked_offsets = ck_alloc(sizeof(u32) * ranked_count);
+        u16* ranked_scores = ck_alloc(sizeof(u16) * ranked_count);
+        u32 ranked_used = 0;
+
+        for (u32 offset = 0; offset < max_off; offset++) {
+          u16 score = key_scores[offset];
+          if (!score) continue;
+
+          u32 pos = ranked_used;
+          while (pos > 0) {
+            u32 prev = pos - 1;
+            if (ranked_scores[prev] > score) break;
+            if (ranked_scores[prev] == score && ranked_offsets[prev] < offset) break;
+            if (pos < ranked_count) {
+              ranked_scores[pos] = ranked_scores[prev];
+              ranked_offsets[pos] = ranked_offsets[prev];
+            }
+            pos--;
+          }
+
+          if (pos < ranked_count) {
+            ranked_scores[pos] = score;
+            ranked_offsets[pos] = offset;
+            if (ranked_used < ranked_count) ranked_used++;
+          }
+        }
+
+        key_count = ranked_used;
+        key_offsets = ck_alloc(sizeof(u32) * key_count);
+        memcpy(key_offsets, ranked_offsets, sizeof(u32) * key_count);
+        ck_free(ranked_offsets);
+        ck_free(ranked_scores);
+      }
+      ck_free(key_scores);
     }
 
     if (key_count > 0) {
-      /* 每个关键字节定向变异 10 次 */
-      if (key_count > 0x7fffffff / 10) stage_max = 0x7fffffff;
-      else stage_max = (s32)(key_count * 10);
+      u32 guided_keys = key_count;
+      if (guided_keys > 64) guided_keys = 64;
+      /* 每个关键字节定向变异 6 次，限制总预算，避免压制正常探索 */
+      if (guided_keys > 0x7fffffff / 6) stage_max = 0x7fffffff;
+      else stage_max = (s32)(guided_keys * 6);
       orig_hit_cnt = queued_paths + unique_crashes;
       stage_cur = 0;
 
-      for (u32 ki = 0; ki < key_count; ki++) {
+      for (u32 ki = 0; ki < guided_keys; ki++) {
         u32 key_offset = key_offsets[ki];
-        for (u32 rep = 0; rep < 10; rep++) {
+        for (u32 rep = 0; rep < 6; rep++) {
           stage_cur++;
 
           switch (UR(5)) {

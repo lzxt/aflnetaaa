@@ -31,6 +31,7 @@ typedef u16 taint_tag_t;
 static u8* __afl_taint_map = NULL;
 static u32 __afl_taint_map_size = 0;
 static u8* __afl_cmp_hit_map = NULL; /* Per-run CMP hit bitmap */
+static u32* __afl_active_cmp_ids = NULL; /* [0]=count, [1..]=active cmp ids */
 
 /* Current input buffer and size */
 static u8* __afl_input_buf = NULL;
@@ -77,6 +78,15 @@ __attribute__((constructor)) void __afl_taint_init(void) {
     if (cmp_shm_id >= 0) {
       __afl_cmp_hit_map = (u8*)shmat(cmp_shm_id, NULL, 0);
       if (__afl_cmp_hit_map == (void*)-1) __afl_cmp_hit_map = NULL;
+    }
+  }
+
+  id_str = getenv("__AFL_ACTIVE_CMP_SHM_ID");
+  if (id_str) {
+    s32 active_cmp_shm_id = atoi(id_str);
+    if (active_cmp_shm_id >= 0) {
+      __afl_active_cmp_ids = (u32*)shmat(active_cmp_shm_id, NULL, 0);
+      if (__afl_active_cmp_ids == (void*)-1) __afl_active_cmp_ids = NULL;
     }
   }
 
@@ -128,7 +138,16 @@ void __afl_check_taint(u32 cmp_id, taint_tag_t tag1, taint_tag_t tag2) {
   
   if (!__afl_taint_map || cmp_id >= MAX_CMP_ID) return;
 
-  if (__afl_cmp_hit_map) __afl_cmp_hit_map[cmp_id] = 1;
+  if (__afl_cmp_hit_map && !__afl_cmp_hit_map[cmp_id]) {
+    __afl_cmp_hit_map[cmp_id] = 1;
+    if (__afl_active_cmp_ids) {
+      u32 count = __afl_active_cmp_ids[0];
+      if (count < MAX_CMP_ID) {
+        __afl_active_cmp_ids[count + 1] = cmp_id;
+        __afl_active_cmp_ids[0] = count + 1;
+      }
+    }
+  }
 
   taint_tag_t combined = __afl_taint_propagate(tag1, tag2);
   
