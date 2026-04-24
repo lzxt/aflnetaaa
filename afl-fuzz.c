@@ -6019,61 +6019,6 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 }
 
 
-static inline u32 choose_guided_offset(struct queue_entry* q, u32 limit, u32 width) {
-
-  if (!limit || width == 0 || limit < width) return 0;
-
-  u32 max_start = limit - width;
-
-  if (q && q->df_key_offsets && q->df_key_count && UR(100) < 60) {
-    u32 ranked = MIN(q->df_key_count, 16u);
-    u32 idx = (UR(100) < 50) ? UR(MIN(ranked, 4u)) : UR(ranked);
-    s32 pos = (s32)q->df_key_offsets[idx] + (s32)UR(5) - 2;
-    if (pos < 0) pos = 0;
-    if ((u32)pos > max_start) pos = (s32)max_start;
-    return (u32)pos;
-  }
-
-  if (q && q->regions && q->region_count && UR(100) < 35) {
-    for (u32 tries = 0; tries < MIN(q->region_count, 8u); tries++) {
-      u32 ridx = UR(q->region_count);
-      region_t* r = &q->regions[ridx];
-      if (!r->modifiable || r->start_byte < 0 || r->end_byte < r->start_byte) continue;
-      u32 start = (u32)r->start_byte;
-      u32 end = (u32)r->end_byte;
-      if (start >= limit) continue;
-      if (end >= limit) end = limit - 1;
-      if (end + 1 < width || start > end + 1 - width) continue;
-      return start + UR((end + 1 - width) - start + 1);
-    }
-  }
-
-  return UR(max_start + 1);
-}
-
-static inline u8 choose_modifiable_region(struct queue_entry* q, u32 limit, u32 min_len,
-                                          u32* start_out, u32* end_out) {
-
-  if (!q || !q->regions || !q->region_count || !start_out || !end_out) return 0;
-
-  for (u32 tries = 0; tries < MIN(q->region_count, 8u); tries++) {
-    u32 ridx = UR(q->region_count);
-    region_t* r = &q->regions[ridx];
-    if (!r->modifiable || r->start_byte < 0 || r->end_byte < r->start_byte) continue;
-    u32 start = (u32)r->start_byte;
-    u32 end = (u32)r->end_byte;
-    if (start >= limit) continue;
-    if (end >= limit) end = limit - 1;
-    if (end < start || (end - start + 1) < min_len) continue;
-    *start_out = start;
-    *end_out = end;
-    return 1;
-  }
-
-  return 0;
-}
-
-
 /* Helper to choose random block len for block operations in fuzz_one().
    Doesn't return zero, provided that max_len is > 0. */
 
@@ -6189,23 +6134,9 @@ static u32 calculate_score(struct queue_entry* q) {
 
     perf_score = (perf_score * base_weight) / 100;
 
-    if (q->favored) {
-      perf_score = (perf_score * 115) / 100;
-    }
-
     if (q->df_total_cmp_cnt > 0) {
       u32 coef = 100 + (DF_ALPHA_PERCENT * (u32)q->df_density_pm) / 1000;
       perf_score = (perf_score * coef) / 100;
-    }
-
-    if (q->df_interesting && q->df_frontier_cmp_cnt == 0) {
-      /* DF feedback without frontier pull is less actionable. */
-      perf_score = (perf_score * 85) / 100;
-    }
-
-    if (q->df_interesting && q->exec_us * 2 > avg_exec_us && q->df_key_count > 48) {
-      /* Slow and diffuse DF seeds should not dominate scheduling. */
-      perf_score = (perf_score * 80) / 100;
     }
 
     if (q->df_frontier_cmp_cnt > 0) {
@@ -7596,10 +7527,7 @@ skip_extras:
    **************************/
 
   /* 定向翻转变异：针对 DF_Interesting 种子 */
-  if (taint_analysis_enabled && queue_cur->df_interesting && taint_map_shm &&
-      queue_cur->df_frontier_cmp_cnt > 0 && queue_cur->df_key_count > 0 &&
-      queue_cur->df_key_count <= 96 &&
-      (queue_cur->favored || queue_cur->df_focus_pm <= 300 || queue_cur->df_frontier_cmp_cnt >= 2)) {
+  if (taint_analysis_enabled && queue_cur->df_interesting && taint_map_shm) {
     
     stage_name  = "taint-directed";
     stage_short = "taint_df";
@@ -7694,20 +7622,19 @@ skip_extras:
 
     if (key_count > 0) {
       u32 guided_keys = key_count;
-      if (guided_keys > 32) guided_keys = 32;
-      /* Higher-ranked offsets get slightly more budget; total budget remains bounded. */
-      if (guided_keys > 0x7fffffff / 5) stage_max = 0x7fffffff;
-      else stage_max = (s32)(guided_keys * 5);
+      if (guided_keys > 64) guided_keys = 64;
+      /* 每个关键字节定向变异 6 次，限制总预算，避免压制正常探索 */
+      if (guided_keys > 0x7fffffff / 6) stage_max = 0x7fffffff;
+      else stage_max = (s32)(guided_keys * 6);
       orig_hit_cnt = queued_paths + unique_crashes;
       stage_cur = 0;
 
       for (u32 ki = 0; ki < guided_keys; ki++) {
         u32 key_offset = key_offsets[ki];
-        u32 reps = (ki < 8) ? 6 : (ki < 16) ? 4 : 3;
-        for (u32 rep = 0; rep < reps; rep++) {
+        for (u32 rep = 0; rep < 6; rep++) {
           stage_cur++;
 
-          switch (UR(7)) {
+          switch (UR(5)) {
             case 0:
               FLIP_BIT(out_buf, key_offset * 8 + UR(8));
               break;
@@ -7738,23 +7665,6 @@ skip_extras:
                   *(u32*)(out_buf + key_offset) = SWAP32(interesting_32[UR(sizeof(interesting_32) >> 2)]);
               }
               break;
-
-            case 5: {
-              u32 win_lo = (key_offset > 2) ? key_offset - 2 : 0;
-              u32 win_hi = MIN((u32)len - 1, key_offset + 2);
-              u32 pos = win_lo + UR(win_hi - win_lo + 1);
-              out_buf[pos] ^= (1 << UR(8));
-              break;
-            }
-
-            case 6: {
-              u32 win_lo = (key_offset > 1) ? key_offset - 1 : 0;
-              u32 win_hi = MIN((u32)len - 1, key_offset + 1);
-              for (u32 pos = win_lo; pos <= win_hi; pos++) {
-                if (!UR(2)) out_buf[pos] ^= 0xFF;
-              }
-              break;
-            }
           }
 
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
@@ -7820,7 +7730,7 @@ havoc_stage:
 
     for (i = 0; i < use_stacking; i++) {
 
-      switch (UR(15 + 2 + (region_level_mutation ? 7 : 0))) {
+      switch (UR(15 + 2 + (region_level_mutation ? 4 : 0))) {
 
         case 0:
 
@@ -7833,7 +7743,7 @@ havoc_stage:
 
           /* Set byte to interesting value. */
 
-          out_buf[choose_guided_offset(queue_cur, temp_len, 1)] = interesting_8[UR(sizeof(interesting_8))];
+          out_buf[UR(temp_len)] = interesting_8[UR(sizeof(interesting_8))];
           break;
 
         case 2:
@@ -7844,12 +7754,12 @@ havoc_stage:
 
           if (UR(2)) {
 
-            *(u16*)(out_buf + choose_guided_offset(queue_cur, temp_len, 2)) =
+            *(u16*)(out_buf + UR(temp_len - 1)) =
               interesting_16[UR(sizeof(interesting_16) >> 1)];
 
           } else {
 
-            *(u16*)(out_buf + choose_guided_offset(queue_cur, temp_len, 2)) = SWAP16(
+            *(u16*)(out_buf + UR(temp_len - 1)) = SWAP16(
               interesting_16[UR(sizeof(interesting_16) >> 1)]);
 
           }
@@ -7864,12 +7774,12 @@ havoc_stage:
 
           if (UR(2)) {
 
-            *(u32*)(out_buf + choose_guided_offset(queue_cur, temp_len, 4)) =
+            *(u32*)(out_buf + UR(temp_len - 3)) =
               interesting_32[UR(sizeof(interesting_32) >> 2)];
 
           } else {
 
-            *(u32*)(out_buf + choose_guided_offset(queue_cur, temp_len, 4)) = SWAP32(
+            *(u32*)(out_buf + UR(temp_len - 3)) = SWAP32(
               interesting_32[UR(sizeof(interesting_32) >> 2)]);
 
           }
@@ -7880,14 +7790,14 @@ havoc_stage:
 
           /* Randomly subtract from byte. */
 
-          out_buf[choose_guided_offset(queue_cur, temp_len, 1)] -= 1 + UR(ARITH_MAX);
+          out_buf[UR(temp_len)] -= 1 + UR(ARITH_MAX);
           break;
 
         case 5:
 
           /* Randomly add to byte. */
 
-          out_buf[choose_guided_offset(queue_cur, temp_len, 1)] += 1 + UR(ARITH_MAX);
+          out_buf[UR(temp_len)] += 1 + UR(ARITH_MAX);
           break;
 
         case 6:
@@ -7898,13 +7808,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 2);
+            u32 pos = UR(temp_len - 1);
 
             *(u16*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 2);
+            u32 pos = UR(temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
             *(u16*)(out_buf + pos) =
@@ -7922,13 +7832,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 2);
+            u32 pos = UR(temp_len - 1);
 
             *(u16*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 2);
+            u32 pos = UR(temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
             *(u16*)(out_buf + pos) =
@@ -7946,13 +7856,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 4);
+            u32 pos = UR(temp_len - 3);
 
             *(u32*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 4);
+            u32 pos = UR(temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
             *(u32*)(out_buf + pos) =
@@ -7970,13 +7880,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 4);
+            u32 pos = UR(temp_len - 3);
 
             *(u32*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = choose_guided_offset(queue_cur, temp_len, 4);
+            u32 pos = UR(temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
             *(u32*)(out_buf + pos) =
@@ -7992,7 +7902,7 @@ havoc_stage:
              why not. We use XOR with 1-255 to eliminate the
              possibility of a no-op. */
 
-          out_buf[choose_guided_offset(queue_cur, temp_len, 1)] ^= 1 + UR(255);
+          out_buf[UR(temp_len)] ^= 1 + UR(255);
           break;
 
         case 11 ... 12: {
@@ -8265,84 +8175,6 @@ havoc_stage:
             ck_free(out_buf);
             out_buf = new_buf;
             temp_len += temp_len;
-            break;
-          }
-
-        /* Field-level generation inside a modifiable request region. */
-        case 21: {
-            u32 rstart, rend;
-            if (!choose_modifiable_region(queue_cur, temp_len, 2, &rstart, &rend)) break;
-            u32 rlen = rend - rstart + 1;
-            u32 width = (rlen >= 4 && UR(2)) ? 4 : 2;
-            u32 pos = rstart + UR(rlen - width + 1);
-            if (width == 2) {
-              if (UR(2)) *(u16*)(out_buf + pos) = interesting_16[UR(sizeof(interesting_16) >> 1)];
-              else *(u16*)(out_buf + pos) = SWAP16(interesting_16[UR(sizeof(interesting_16) >> 1)]);
-            } else {
-              if (UR(2)) *(u32*)(out_buf + pos) = interesting_32[UR(sizeof(interesting_32) >> 2)];
-              else *(u32*)(out_buf + pos) = SWAP32(interesting_32[UR(sizeof(interesting_32) >> 2)]);
-            }
-            break;
-          }
-
-        /* Protocol template overwrite: overwrite one request region using another region from same seed. */
-        case 22: {
-            u32 dst_start, dst_end;
-            if (!choose_modifiable_region(queue_cur, temp_len, 1, &dst_start, &dst_end)) break;
-            if (!queue_cur->regions || queue_cur->region_count < 2) break;
-
-            region_t* src = NULL;
-            for (u32 tries = 0; tries < MIN(queue_cur->region_count, 8u); tries++) {
-              u32 ridx = UR(queue_cur->region_count);
-              region_t* cand = &queue_cur->regions[ridx];
-              if (cand->start_byte < 0 || cand->end_byte < cand->start_byte) continue;
-              if ((u32)cand->start_byte >= len) continue;
-              src = cand;
-              break;
-            }
-            if (!src) break;
-
-            u32 src_start = (u32)src->start_byte;
-            u32 src_end = MIN((u32)src->end_byte, len - 1);
-            if (src_end < src_start) break;
-
-            u32 dst_len = dst_end - dst_start + 1;
-            u32 src_len = src_end - src_start + 1;
-            u32 copy_len = MIN(dst_len, src_len);
-            memcpy(out_buf + dst_start, in_buf + src_start, copy_len);
-            break;
-          }
-
-        /* Protocol template insert: duplicate a request region near another request boundary. */
-        case 23: {
-            if (!queue_cur->regions || queue_cur->region_count < 1) break;
-            region_t* src = NULL;
-            for (u32 tries = 0; tries < MIN(queue_cur->region_count, 8u); tries++) {
-              u32 ridx = UR(queue_cur->region_count);
-              region_t* cand = &queue_cur->regions[ridx];
-              if (cand->start_byte < 0 || cand->end_byte < cand->start_byte) continue;
-              if ((u32)cand->start_byte >= len) continue;
-              src = cand;
-              break;
-            }
-            if (!src) break;
-
-            u32 src_start = (u32)src->start_byte;
-            u32 src_end = MIN((u32)src->end_byte, len - 1);
-            if (src_end < src_start) break;
-            u32 src_len = src_end - src_start + 1;
-            if (temp_len + src_len >= MAX_FILE) break;
-
-            u32 insert_at = src_end + 1;
-            if (insert_at > temp_len) insert_at = temp_len;
-
-            u8* new_buf = ck_alloc_nozero(temp_len + src_len);
-            memcpy(new_buf, out_buf, insert_at);
-            memcpy(new_buf + insert_at, in_buf + src_start, src_len);
-            memcpy(new_buf + insert_at + src_len, out_buf + insert_at, temp_len - insert_at);
-            ck_free(out_buf);
-            out_buf = new_buf;
-            temp_len += src_len;
             break;
           }
 
