@@ -144,7 +144,6 @@ bool AFLCoverage::runOnModule(Module &M) {
   LLVMContext &C = M.getContext();
 
   IntegerType *Int8Ty  = IntegerType::getInt8Ty(C);
-  IntegerType *Int16Ty = IntegerType::getInt16Ty(C);
   IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
 
   char *auto_dict_env = getenv("AFL_AUTO_DICT");
@@ -177,21 +176,21 @@ bool AFLCoverage::runOnModule(Module &M) {
       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
 
   FunctionType *TaintLoadTy = FunctionType::get(
-      Int16Ty, {PointerType::get(Int8Ty, 0), Int32Ty}, false);
+      Int32Ty, {PointerType::get(Int8Ty, 0), Int32Ty}, false);
   FunctionCallee TaintLoadFn = M.getOrInsertFunction("__afl_taint_load", TaintLoadTy);
 
   FunctionType *TaintStoreTy = FunctionType::get(
       Type::getVoidTy(C),
-      {PointerType::get(Int8Ty, 0), Int32Ty, Int16Ty},
+      {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty},
       false);
   FunctionCallee TaintStoreFn = M.getOrInsertFunction("__afl_taint_store", TaintStoreTy);
 
   FunctionType *TaintPropTy = FunctionType::get(
-      Int16Ty, {Int16Ty, Int16Ty}, false);
+      Int32Ty, {Int32Ty, Int32Ty}, false);
   FunctionCallee TaintPropFn = M.getOrInsertFunction("__afl_taint_propagate", TaintPropTy);
 
   FunctionType *CheckTaintTy = FunctionType::get(
-      Type::getVoidTy(C), {Int32Ty, Int16Ty, Int16Ty}, false);
+      Type::getVoidTy(C), {Int32Ty, Int32Ty, Int32Ty}, false);
   FunctionCallee CheckTaintFn =
       M.getOrInsertFunction("__afl_check_taint_with_tags", CheckTaintTy);
 
@@ -199,6 +198,8 @@ bool AFLCoverage::runOnModule(Module &M) {
       Type::getVoidTy(C), {PointerType::get(Int8Ty, 0), Int32Ty}, false);
   FunctionCallee TaintSourceFn =
       M.getOrInsertFunction("__afl_taint_source", TaintSourceTy);
+  FunctionCallee TaintSourceNetFn =
+      M.getOrInsertFunction("__afl_taint_source_net", TaintSourceTy);
 
   int inst_blocks = 0;
 
@@ -265,13 +266,13 @@ bool AFLCoverage::runOnModule(Module &M) {
         DenseMap<Value*, Value*> value_tags;
         std::function<Value*(Value*, IRBuilder<>&)> buildTagForValue;
         buildTagForValue = [&](Value* V, IRBuilder<> &B) -> Value* {
-          if (!V) return ConstantInt::get(Int16Ty, 0);
+          if (!V) return ConstantInt::get(Int32Ty, 0);
 
           DenseMap<Value*, Value*>::iterator it = value_tags.find(V);
           if (it != value_tags.end()) return it->second;
 
           if (isa<Constant>(V)) {
-            return ConstantInt::get(Int16Ty, 0);
+            return ConstantInt::get(Int32Ty, 0);
           }
 
           if (auto *LI = dyn_cast<LoadInst>(V)) {
@@ -294,14 +295,14 @@ bool AFLCoverage::runOnModule(Module &M) {
                 op == Instruction::Or  || op == Instruction::Xor) {
               Value *T1 = buildTagForValue(BO->getOperand(0), B);
               Value *T2 = buildTagForValue(BO->getOperand(1), B);
-              Value *HasT1 = B.CreateICmpNE(T1, ConstantInt::get(Int16Ty, 0));
-              Value *HasT2 = B.CreateICmpNE(T2, ConstantInt::get(Int16Ty, 0));
+              Value *HasT1 = B.CreateICmpNE(T1, ConstantInt::get(Int32Ty, 0));
+              Value *HasT2 = B.CreateICmpNE(T2, ConstantInt::get(Int32Ty, 0));
               Value *HasAny = B.CreateOr(HasT1, HasT2);
               Value *PropTag = B.CreateCall(TaintPropFn, {T1, T2});
               Value *Tag = B.CreateSelect(
                   HasAny,
                   PropTag,
-                  ConstantInt::get(Int16Ty, 0));
+                  ConstantInt::get(Int32Ty, 0));
               value_tags[V] = Tag;
               return Tag;
             }
@@ -320,7 +321,7 @@ bool AFLCoverage::runOnModule(Module &M) {
             return Tag;
           }
 
-          return ConstantInt::get(Int16Ty, 0);
+          return ConstantInt::get(Int32Ty, 0);
         };
 
         for (auto &I : BB) {
@@ -369,7 +370,7 @@ bool AFLCoverage::runOnModule(Module &M) {
               TaintIRB.CreateCall(CheckTaintFn, {
                   ConstantInt::get(Int32Ty, cmp_id),
                   CondTag,
-                  ConstantInt::get(Int16Ty, 0)
+                  ConstantInt::get(Int32Ty, 0)
               });
             }
           }
@@ -439,7 +440,10 @@ bool AFLCoverage::runOnModule(Module &M) {
               Value *HasInput = TaintIRB.CreateICmpSGT(Ret32, ConstantInt::get(Int32Ty, 0));
               Value *SafeLen = TaintIRB.CreateSelect(
                   HasInput, Ret32, ConstantInt::get(Int32Ty, 0));
-              TaintIRB.CreateCall(TaintSourceFn, {
+              /* recv/recvfrom: cumulative offsets match AFLNet concatenated seeds;
+                 read(): per-call offsets (or AFL_TAINT_STREAM_READ=1 in runtime). */
+              FunctionCallee SrcFn = (FnName == "read") ? TaintSourceFn : TaintSourceNetFn;
+              TaintIRB.CreateCall(SrcFn, {
                   TaintIRB.CreateBitCast(Buf, PointerType::get(Int8Ty, 0)),
                   SafeLen
               });
@@ -490,12 +494,12 @@ bool AFLCoverage::runOnModule(Module &M) {
               IRBuilder<> TaintIRB(Next);
               Value *T1 = buildTagForValue(BO->getOperand(0), TaintIRB);
               Value *T2 = buildTagForValue(BO->getOperand(1), TaintIRB);
-              Value *HasT1 = TaintIRB.CreateICmpNE(T1, ConstantInt::get(Int16Ty, 0));
-              Value *HasT2 = TaintIRB.CreateICmpNE(T2, ConstantInt::get(Int16Ty, 0));
+              Value *HasT1 = TaintIRB.CreateICmpNE(T1, ConstantInt::get(Int32Ty, 0));
+              Value *HasT2 = TaintIRB.CreateICmpNE(T2, ConstantInt::get(Int32Ty, 0));
               Value *HasAny = TaintIRB.CreateOr(HasT1, HasT2);
               Value *PropTag = TaintIRB.CreateCall(TaintPropFn, {T1, T2});
               value_tags[BO] = TaintIRB.CreateSelect(
-                  HasAny, PropTag, ConstantInt::get(Int16Ty, 0));
+                  HasAny, PropTag, ConstantInt::get(Int32Ty, 0));
             }
           }
 

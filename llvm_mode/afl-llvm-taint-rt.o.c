@@ -23,9 +23,9 @@
 #define MAX_CMP_ID 4096
 #endif
 
-/* 16-bit taint tag, value = input_offset + 1 */
-typedef u16 taint_tag_t;
-#define TAINT_MAX_OFFSET 65534u
+/* 32-bit taint tag, value = input_offset + 1 */
+typedef u32 taint_tag_t;
+#define TAINT_MAX_OFFSET (MAX_FILE - 1)
 
 /* Taint map: bitmap for each CMP_ID, tracking which input bytes influenced it */
 static u8* __afl_taint_map = NULL;
@@ -36,6 +36,10 @@ static u32* __afl_active_cmp_ids = NULL; /* [0]=count, [1..]=active cmp ids */
 /* Current input buffer and size */
 static u8* __afl_input_buf = NULL;
 static u32 __afl_input_size = 0;
+
+/* Cumulative byte offset for recv/recvfrom (and optional read); matches AFLNet
+   queue file layout (concatenated request messages). Resets each process. */
+static u32 __afl_net_rx_base = 0;
 
 /* Shadow memory: maps each memory address to its taint tag */
 #define SHADOW_MEM_SIZE (256 * 1024 * 1024)  /* 256MB shadow memory */
@@ -118,18 +122,51 @@ taint_tag_t __afl_taint_propagate(taint_tag_t tag1, taint_tag_t tag2) {
   return tag2;
 }
 
-/* Mark input bytes as tainted after recv/read */
-void __afl_taint_source(u8* buf, u32 len) {
+static u8 __afl_want_stream_read(void) {
+  static s8 cache = -1;
+  if (cache < 0)
+    cache = (getenv("AFL_TAINT_STREAM_READ") && getenv("AFL_TAINT_STREAM_READ")[0] != '0') ? 1 : 0;
+  return (u8)cache;
+}
+
+/* recv/recvfrom: tags use cumulative offsets so multi-packet TCP matches AFLNet seeds */
+void __afl_taint_source_net(u8* buf, u32 len) {
+
   __afl_set_taint_input(buf, len);
-  
+
+  if (!__afl_shadow_mem) __afl_init_shadow_mem();
+  if (!__afl_shadow_mem || !buf || !len) return;
+
+  for (u32 i = 0; i < len; i++) {
+    u32 g = __afl_net_rx_base + i;
+    if (g >= MAX_FILE || g > TAINT_MAX_OFFSET) break;
+    u32 idx = __afl_ptr_to_shadow_idx(&buf[i]);
+    __afl_shadow_mem[idx] = (taint_tag_t)(g + 1);
+  }
+
+  if (__afl_net_rx_base < MAX_FILE) {
+    u32 add = MIN(len, MAX_FILE - __afl_net_rx_base);
+    __afl_net_rx_base += add;
+  }
+}
+
+/* Per-syscall relative offsets (legacy); use for read() unless AFL_TAINT_STREAM_READ=1 */
+void __afl_taint_source(u8* buf, u32 len) {
+
+  if (__afl_want_stream_read()) {
+    __afl_taint_source_net(buf, len);
+    return;
+  }
+
+  __afl_set_taint_input(buf, len);
+
   if (!__afl_shadow_mem) __afl_init_shadow_mem();
   if (!__afl_shadow_mem || !buf) return;
-  
-  /* 为每个字节分配 16-bit 标签（偏移量+1） */
+
   for (u32 i = 0; i < len && i < MAX_FILE; i++) {
     if (i > TAINT_MAX_OFFSET) break;
     u32 idx = __afl_ptr_to_shadow_idx(&buf[i]);
-    __afl_shadow_mem[idx] = (taint_tag_t)(i + 1);  /* +1 to avoid 0 (untainted) */
+    __afl_shadow_mem[idx] = (taint_tag_t)(i + 1);
   }
 }
 

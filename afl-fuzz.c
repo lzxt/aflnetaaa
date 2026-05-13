@@ -196,6 +196,21 @@ static u8 last_protocol_state_new = 0; /* Last execution discovered new protocol
 #define ENERGY_WEIGHT_PROTOCOL 120 /* 1.2 */
 #define DF_ALPHA_PERCENT      100  /* alpha = 1.0 */
 
+static inline u8 taint_directed_enabled(void) {
+  char *v = getenv("AFL_TAINT_DIRECTED");
+  return (!v || v[0] != '0');
+}
+
+static inline u8 taint_region_select_enabled(void) {
+  char *v = getenv("AFL_TAINT_REGION_SELECT");
+  return (!v || v[0] != '0');
+}
+
+static inline u8 taint_aggressive_mode(void) {
+  char *v = getenv("AFL_TAINT_AGGRESSIVE");
+  return (v && v[0] && v[0] != '0');
+}
+
 static inline void update_cmp_seen_from_run(void) {
   if (!cmp_hit_shm || !cmp_seen_global) return;
   for (u32 i = 0; i < MAX_CMP_ID; i++) {
@@ -356,6 +371,76 @@ struct queue_entry {
   u32 df_key_count;                   /* Number of focused offsets         */
 
 };
+
+static inline u8 df_seed_is_high_quality(struct queue_entry *q) {
+  if (!q || !q->df_interesting || !q->df_key_count) return 0;
+  if (!q->df_frontier_cmp_cnt && !taint_aggressive_mode()) return 0;
+
+  if (q->region_count > 1) {
+    if (q->df_focus_pm && q->df_focus_pm > 300 && !taint_aggressive_mode()) return 0;
+    if (q->df_density_pm < 50 && !taint_aggressive_mode()) return 0;
+  } else {
+    if (q->df_focus_pm && q->df_focus_pm > 500 && !taint_aggressive_mode()) return 0;
+  }
+
+  return 1;
+}
+
+static inline u32 df_directed_key_budget(struct queue_entry *q, u32 key_count, u32 len) {
+  u32 budget = key_count;
+
+  if (taint_aggressive_mode()) return MIN(budget, 128u);
+
+  if (q && q->region_count > 1) budget = MIN(budget, 24u);
+  else budget = MIN(budget, 64u);
+
+  if (len > 4096) budget = MIN(budget, 16u);
+  if (len > 16384) budget = MIN(budget, 8u);
+
+  return budget;
+}
+
+static inline u32 df_directed_reps(struct queue_entry *q, u32 len) {
+  if (taint_aggressive_mode()) return 6;
+  if (q && q->region_count > 1) return (len > 4096) ? 2 : 3;
+  return (len > 4096) ? 3 : 6;
+}
+
+static inline u8 df_offset_in_region(struct queue_entry *q, u32 region_id, u32 offset) {
+  if (!q || region_id >= q->region_count) return 0;
+  if (q->regions[region_id].start_byte < 0 || q->regions[region_id].end_byte < 0) return 0;
+  return offset >= (u32)q->regions[region_id].start_byte &&
+         offset <= (u32)q->regions[region_id].end_byte;
+}
+
+static inline u8 select_df_focused_region(struct queue_entry *q,
+                                          u32 *start_region,
+                                          u32 *region_count) {
+  if (!taint_region_select_enabled() || !q || !q->df_key_offsets ||
+      !q->df_key_count || !q->region_count) return 0;
+
+  u32 best_region = 0, best_score = 0;
+
+  for (u32 r = 0; r < q->region_count; r++) {
+    if (q->regions[r].start_byte < 0 || q->regions[r].end_byte < q->regions[r].start_byte) continue;
+
+    u32 score = 0;
+    for (u32 k = 0; k < q->df_key_count; k++) {
+      if (df_offset_in_region(q, r, q->df_key_offsets[k])) score++;
+    }
+
+    if (score > best_score) {
+      best_score = score;
+      best_region = r;
+    }
+  }
+
+  if (!best_score) return 0;
+
+  *start_region = best_region;
+  *region_count = 1;
+  return 1;
+}
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
@@ -1741,9 +1826,6 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->df_focus_pm = 0;
   q->df_min_offset = 0;
   q->df_max_offset = 0;
-  q->df_key_offsets = NULL;
-  q->df_key_count = 0;
-  q->df_density_pm = 0;
   q->df_key_offsets = NULL;
   q->df_key_count = 0;
 
@@ -4349,6 +4431,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
               queue_top->df_focus_pm = 0;
               queue_top->df_min_offset = 0;
               queue_top->df_max_offset = 0;
+              queue_top->df_key_offsets = NULL;
+              queue_top->df_key_count = 0;
 
               /* Persist focused DF offsets for strong directed mutation. */
               u32 max_off = MIN((u32)full_len, (u32)MAX_FILE);
@@ -4419,6 +4503,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
                 }
                 ck_free(key_scores);
               }
+            }
+            if (queue_top) {
+              u8 *fn_replay = alloc_printf("%s/replayable-queue/%s", out_dir, basename(queue_top->fname));
+              save_kl_messages_to_file(kl_messages, fn_replay, 1, messages_sent);
+              ck_free(fn_replay);
             }
             consume_frontier_cmps_from_run(cmp_has_new_df);
             if (prev_taint_map) {
@@ -6144,16 +6233,14 @@ static u32 calculate_score(struct queue_entry* q) {
       perf_score = (perf_score * frontier_bonus) / 100;
     }
 
-    if (q->df_interesting && q->df_key_count > 0) {
-      /* Strong guidance: fewer focused bytes => higher mutation payoff. */
-      u32 focus_bonus = (q->df_key_count <= 64) ? 150 :
-                        (q->df_key_count <= 256) ? 125 : 110;
+    if (q->df_interesting && q->df_key_count > 0 && df_seed_is_high_quality(q)) {
+      u32 focus_bonus = (q->df_key_count <= 64) ? 130 :
+                        (q->df_key_count <= 256) ? 115 : 105;
       perf_score = (perf_score * focus_bonus) / 100;
     }
 
-    if (q->df_focus_pm > 0 && q->df_focus_pm <= 250) {
-      /* Compact semantic region: mutation is likely to be high-yield. */
-      perf_score = (perf_score * 120) / 100;
+    if (q->df_focus_pm > 0 && q->df_focus_pm <= 250 && df_seed_is_high_quality(q)) {
+      perf_score = (perf_score * 110) / 100;
     }
 
     /* Heating: if no new edge in 30min, prioritize DF seeds (~80% time). */
@@ -6163,13 +6250,11 @@ static u32 calculate_score(struct queue_entry* q) {
     }
 
     if (df_heating_mode) {
-      if (q->df_interesting) {
-        /* Potential from DF density; keep in reasonable range. */
-        u32 hot_boost = 140 + ((u32)q->df_density_pm / 20); /* 1.4x .. 1.9x */
+      if (q->df_interesting && df_seed_is_high_quality(q)) {
+        u32 hot_boost = 120 + ((u32)q->df_density_pm / 40);
         perf_score = (perf_score * hot_boost) / 100;
       } else {
-        /* Keep baseline exploration alive; avoid starving AFLNet core loop. */
-        perf_score = (perf_score * 70) / 100;
+        perf_score = (perf_score * 85) / 100;
       }
     }
   }
@@ -6439,6 +6524,8 @@ AFLNET_REGIONS_SELECTION:;
   cur_depth = queue_cur->depth;
 
   u32 M2_start_region_ID = 0, M2_region_count = 0;
+  u32 M2_global_start = 0, M2_global_end = 0;
+  u8 M2_global_valid = 0;
   /* Identify the prefix M1, the candidate subsequence M2, and the suffix M3. See AFLNet paper */
   /* In this implementation, we only need to indentify M2_start_region_ID which is the first region of M2
   and M2_region_count which is the total number of regions in M2. How the information is identified is
@@ -6488,13 +6575,54 @@ AFLNET_REGIONS_SELECTION:;
       if (M2_start_region_ID >= queue_cur->region_count) return 1;
     }
   } else {
-    /* Select M2 randomly */
-    u32 total_region = queue_cur->region_count;
-    if (total_region == 0) PFATAL("0 region found for %s", queue_cur->fname);
+    /* Select M2. DF seeds carry global byte offsets; for multi-message protocols
+       (FTP commands, DTLS records, HTTP/DAAP requests), focus AFLNet's M2 on
+       the message that contains the highest-value tainted offsets. */
+    if (select_df_focused_region(queue_cur, &M2_start_region_ID, &M2_region_count)) {
+      /* already selected */
+    } else {
+      u32 total_region = queue_cur->region_count;
+      if (total_region == 0) PFATAL("0 region found for %s", queue_cur->fname);
 
-    M2_start_region_ID = UR(total_region);
-    M2_region_count = UR(total_region - M2_start_region_ID);
-    if (M2_region_count == 0) M2_region_count++; //Mutate one region at least
+      M2_start_region_ID = UR(total_region);
+      M2_region_count = UR(total_region - M2_start_region_ID);
+      if (M2_region_count == 0) M2_region_count++; //Mutate one region at least
+    }
+  }
+
+  if (M2_region_count > 1 && queue_cur->df_interesting && queue_cur->df_key_offsets &&
+      queue_cur->df_key_count && taint_region_select_enabled()) {
+    u32 best_region = M2_start_region_ID;
+    u32 best_score = 0;
+    u32 last_region_ID = M2_start_region_ID + M2_region_count;
+    if (last_region_ID > queue_cur->region_count) last_region_ID = queue_cur->region_count;
+
+    for (u32 r = M2_start_region_ID; r < last_region_ID; r++) {
+      u32 score = 0;
+      for (u32 k = 0; k < queue_cur->df_key_count; k++) {
+        if (df_offset_in_region(queue_cur, r, queue_cur->df_key_offsets[k])) score++;
+      }
+      if (score > best_score) {
+        best_score = score;
+        best_region = r;
+      }
+    }
+
+    if (best_score > 0) {
+      M2_start_region_ID = best_region;
+      M2_region_count = 1;
+    }
+  }
+
+  if (M2_region_count > 0 && M2_start_region_ID < queue_cur->region_count) {
+    u32 last_region_ID = M2_start_region_ID + M2_region_count - 1;
+    if (last_region_ID >= queue_cur->region_count) last_region_ID = queue_cur->region_count - 1;
+    if (queue_cur->regions[M2_start_region_ID].start_byte >= 0 &&
+        queue_cur->regions[last_region_ID].end_byte >= queue_cur->regions[M2_start_region_ID].start_byte) {
+      M2_global_start = (u32)queue_cur->regions[M2_start_region_ID].start_byte;
+      M2_global_end = (u32)queue_cur->regions[last_region_ID].end_byte;
+      M2_global_valid = 1;
+    }
   }
 
   /* Construct the kl_messages linked list and identify boundary pointers (M2_prev and M2_next) */
@@ -6557,13 +6685,13 @@ AFLNET_REGIONS_SELECTION:;
      testing in earlier, resumed runs (passed_det). */
 
   if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
-    goto havoc_stage;
+    goto taint_directed_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
      for this master instance. */
 
   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
-    goto havoc_stage;
+    goto taint_directed_stage;
 
   doing_det = 1;
 
@@ -7516,18 +7644,22 @@ skip_user_extras:
 
 skip_extras:
 
-  /* If we made this to here without jumping to havoc_stage or abandon_entry,
+  /* If we made this to here without jumping to taint_directed_stage or abandon_entry,
      we're properly done with deterministic steps and can mark it as such
      in the .state/ directory. */
 
   if (!queue_cur->passed_det) mark_as_det_done(queue_cur);
+
+taint_directed_stage:;
 
   /**************************
    * DIRECTED MUTATION (DF) *
    **************************/
 
   /* 定向翻转变异：针对 DF_Interesting 种子 */
-  if (taint_analysis_enabled && queue_cur->df_interesting && taint_map_shm) {
+  if (taint_analysis_enabled && taint_directed_enabled() &&
+      queue_cur->df_interesting && df_seed_is_high_quality(queue_cur) &&
+      taint_map_shm) {
     
     stage_name  = "taint-directed";
     stage_short = "taint_df";
@@ -7546,9 +7678,9 @@ skip_extras:
       if (run_target(argv, exec_tmout) == FAULT_ERROR) goto abandon_entry;
       memcpy(out_buf, in_buf, len);
 
-      u16* key_scores = ck_alloc((len ? len : 1) * sizeof(u16));
-      memset(key_scores, 0, (len ? len : 1) * sizeof(u16));
-      u32 max_off = MIN((u32)len, (u32)MAX_FILE);
+      u32 max_off = MIN((u32)queue_cur->len, (u32)MAX_FILE);
+      u16* key_scores = ck_alloc((max_off ? max_off : 1) * sizeof(u16));
+      memset(key_scores, 0, (max_off ? max_off : 1) * sizeof(u16));
 
       if (active_cmp_ids_shm && active_cmp_ids_shm[0] > 0) {
         u32 active_cmp_count = active_cmp_ids_shm[0];
@@ -7621,17 +7753,44 @@ skip_extras:
     }
 
     if (key_count > 0) {
-      u32 guided_keys = key_count;
-      if (guided_keys > 64) guided_keys = 64;
-      /* 每个关键字节定向变异 6 次，限制总预算，避免压制正常探索 */
-      if (guided_keys > 0x7fffffff / 6) stage_max = 0x7fffffff;
-      else stage_max = (s32)(guided_keys * 6);
+      if (M2_global_valid) {
+        u32 *m2_key_offsets = ck_alloc(sizeof(u32) * key_count);
+        u32 m2_key_count = 0;
+
+        for (u32 ko = 0; ko < key_count; ko++) {
+          u32 global_offset = key_offsets[ko];
+          if (global_offset < M2_global_start || global_offset > M2_global_end) continue;
+          u32 local_offset = global_offset - M2_global_start;
+          if (local_offset >= (u32)len) continue;
+          m2_key_offsets[m2_key_count++] = local_offset;
+        }
+
+        if (key_offsets && key_offsets != queue_cur->df_key_offsets) ck_free(key_offsets);
+        key_offsets = m2_key_offsets;
+        key_count = m2_key_count;
+        if (!key_count && key_offsets) {
+          ck_free(key_offsets);
+          key_offsets = NULL;
+        }
+      } else {
+        if (key_offsets && key_offsets != queue_cur->df_key_offsets) ck_free(key_offsets);
+        key_offsets = NULL;
+        key_count = 0;
+      }
+    }
+
+    if (key_count > 0) {
+      u32 guided_keys = df_directed_key_budget(queue_cur, key_count, len);
+      u32 reps = df_directed_reps(queue_cur, len);
+      if (!guided_keys || !reps) guided_keys = 0;
+      if (guided_keys && guided_keys > 0x7fffffff / reps) stage_max = 0x7fffffff;
+      else stage_max = (s32)(guided_keys * reps);
       orig_hit_cnt = queued_paths + unique_crashes;
       stage_cur = 0;
 
       for (u32 ki = 0; ki < guided_keys; ki++) {
         u32 key_offset = key_offsets[ki];
-        for (u32 rep = 0; rep < 6; rep++) {
+        for (u32 rep = 0; rep < reps; rep++) {
           stage_cur++;
 
           switch (UR(5)) {
@@ -7667,12 +7826,15 @@ skip_extras:
               break;
           }
 
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+          if (common_fuzz_stuff(argv, out_buf, len)) {
+            if (key_offsets) ck_free(key_offsets);
+            goto abandon_entry;
+          }
           memcpy(out_buf, in_buf, len);
         }
       }
 
-      if (key_offsets && key_offsets != queue_cur->df_key_offsets) ck_free(key_offsets);
+      if (key_offsets) ck_free(key_offsets);
       new_hit_cnt = queued_paths + unique_crashes;
       stage_finds[STAGE_HAVOC] += new_hit_cnt - orig_hit_cnt;
       stage_cycles[STAGE_HAVOC] += stage_max;
