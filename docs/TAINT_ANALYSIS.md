@@ -117,6 +117,11 @@ afl-fuzz -i in -o out -T taint -- ./your_target [args...]
 
 - `AFL_TAINT_ANALYSIS=1`：启用污点分析（由 `-T taint` 自动设置）
 - `__AFL_TAINT_MAP_SHM_ID=<id>`：污点映射表的共享内存 ID（自动设置）
+- **输入字节偏移与 AFLNet 种子对齐**：`recv` / `recvfrom` 使用**跨多次调用的累积偏移**，与 AFLNet 将多条请求拼接成单个种子文件的布局一致；单包 DNS 与多包 RTSP/FTP 等均能正确映射到队列文件中的字节位置。
+- `AFL_TAINT_STREAM_READ=1`：若被测服务用 `read()` 从套接字按流读入（而非 `recv`），可设置此项，使 `read()` 也使用与 `recv` 相同的累积偏移。若目标在收包前用 `read()` 读配置文件，**不要**开启，否则偏移会与种子错位。
+- `AFL_TAINT_DIRECTED=0`：关闭额外的 `taint-directed` 局部变异阶段，但保留 DF 种子保存与调度信息。用于判断覆盖率下降是否由定向变异预算压制 AFLNet 原生 region/state 探索造成。
+- `AFL_TAINT_AGGRESSIVE=1`：恢复更激进的 DF 策略，放宽 DF 种子质量门控，并提高关键字节数量和每字节变异次数。建议只在 DNS 或短单包协议上尝试；RTSP/FTP/SMTP 等多报文长会话默认使用保守混合策略。
+- `AFL_TAINT_REGION_SELECT=0`：关闭 DF 驱动的 AFLNet region 选择。默认开启时，DF 种子会优先选择包含最多 taint 关键偏移的消息作为 M2；这对 FTP 命令序列、DTLS record、HTTP/DAAP 请求这类多消息协议尤其重要，因为 taint 偏移来自整条 seed，而 AFLNet 实际变异的是某个 M2 子序列。
 
 ### 数据结构
 
@@ -133,7 +138,7 @@ afl-fuzz -i in -o out -T taint -- ./your_target [args...]
 ## 未来改进方向
 
 1. **完整的污点传播**：实现完整的 shadow memory 机制
-2. **定向变异优化**：完善基于映射表的精准变异策略
+2. **定向变异优化**：完善基于映射表的精准变异策略；当前实现已加入保守混合策略，对多报文/长会话种子降低 DF 局部变异预算，避免压制 AFLNet 的状态机和 region-level 变异。
 3. **调度算法优化**：改进 DF_Interesting 种子的调度优先级
 4. **多线程支持**：支持多线程程序的污点分析
 

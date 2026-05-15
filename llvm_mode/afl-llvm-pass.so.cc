@@ -201,6 +201,26 @@ bool AFLCoverage::runOnModule(Module &M) {
   FunctionCallee TaintSourceNetFn =
       M.getOrInsertFunction("__afl_taint_source_net", TaintSourceTy);
 
+  FunctionType *TaintSourceIovTy = FunctionType::get(
+      Type::getVoidTy(C), {PointerType::get(Int8Ty, 0), Int32Ty, Int32Ty}, false);
+  FunctionCallee TaintSourceIovFn =
+      M.getOrInsertFunction("__afl_taint_source_iov", TaintSourceIovTy);
+
+  FunctionType *TaintSourceMsgTy = FunctionType::get(
+      Type::getVoidTy(C), {PointerType::get(Int8Ty, 0), Int32Ty}, false);
+  FunctionCallee TaintSourceMsgFn =
+      M.getOrInsertFunction("__afl_taint_source_msghdr", TaintSourceMsgTy);
+
+  FunctionType *TaintMemcpyTy = FunctionType::get(
+      Type::getVoidTy(C), {PointerType::get(Int8Ty, 0), PointerType::get(Int8Ty, 0), Int32Ty}, false);
+  FunctionCallee TaintMemcpyFn =
+      M.getOrInsertFunction("__afl_taint_memcpy", TaintMemcpyTy);
+
+  FunctionType *CheckTaintBufTy = FunctionType::get(
+      Type::getVoidTy(C), {Int32Ty, PointerType::get(Int8Ty, 0), Int32Ty}, false);
+  FunctionCallee CheckTaintBufFn =
+      M.getOrInsertFunction("__afl_check_taint_buf", CheckTaintBufTy);
+
   int inst_blocks = 0;
 
   if (auto_dict_enabled) {
@@ -379,8 +399,8 @@ bool AFLCoverage::runOnModule(Module &M) {
             Function *Callee = Call->getCalledFunction();
             if (!Callee) continue;
             StringRef FnName = Callee->getName();
+            bool IsLlvmMemcpy = FnName.startswith("llvm.memcpy") || FnName.startswith("llvm.memmove");
             
-            /* [修改] 使用 getNumArgOperands() 替代 arg_size() 以兼容旧版 LLVM */
             if ((FnName == "memcmp" || FnName == "strcmp" || 
                  FnName == "strncmp" || FnName == "strcasecmp" ||
                  FnName == "strncasecmp" || FnName == "bcmp") && 
@@ -405,18 +425,22 @@ bool AFLCoverage::runOnModule(Module &M) {
               unsigned int cmp_id = cmp_id_counter++;
               if (cmp_id < 4096) {
                 IRBuilder<> TaintIRB(&I);
-                Value *Arg1Tag = TaintIRB.CreateCall(TaintLoadFn, {
-                    TaintIRB.CreateBitCast(Call->getArgOperand(0), PointerType::get(Int8Ty, 0)),
-                    ConstantInt::get(Int32Ty, 1)
+                Value *Len = ConstantInt::get(Int32Ty, 64);
+                if ((FnName == "memcmp" || FnName == "strncmp" ||
+                     FnName == "strncasecmp" || FnName == "bcmp") &&
+                    Call->getNumArgOperands() >= 3) {
+                  Value *RawLen = Call->getArgOperand(2);
+                  if (RawLen->getType()->isIntegerTy())
+                    Len = TaintIRB.CreateZExtOrTrunc(RawLen, Int32Ty);
+                }
+
+                Value *Arg1 = TaintIRB.CreateBitCast(Call->getArgOperand(0), PointerType::get(Int8Ty, 0));
+                Value *Arg2 = TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0));
+                TaintIRB.CreateCall(CheckTaintBufFn, {
+                    ConstantInt::get(Int32Ty, cmp_id), Arg1, Len
                 });
-                Value *Arg2Tag = TaintIRB.CreateCall(TaintLoadFn, {
-                    TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0)),
-                    ConstantInt::get(Int32Ty, 1)
-                });
-                TaintIRB.CreateCall(CheckTaintFn, {
-                    ConstantInt::get(Int32Ty, cmp_id),
-                    Arg1Tag,
-                    Arg2Tag
+                TaintIRB.CreateCall(CheckTaintBufFn, {
+                    ConstantInt::get(Int32Ty, cmp_id), Arg2, Len
                 });
               }
             }
@@ -440,12 +464,50 @@ bool AFLCoverage::runOnModule(Module &M) {
               Value *HasInput = TaintIRB.CreateICmpSGT(Ret32, ConstantInt::get(Int32Ty, 0));
               Value *SafeLen = TaintIRB.CreateSelect(
                   HasInput, Ret32, ConstantInt::get(Int32Ty, 0));
-              /* recv/recvfrom: cumulative offsets match AFLNet concatenated seeds;
-                 read(): per-call offsets (or AFL_TAINT_STREAM_READ=1 in runtime). */
               FunctionCallee SrcFn = (FnName == "read") ? TaintSourceFn : TaintSourceNetFn;
               TaintIRB.CreateCall(SrcFn, {
                   TaintIRB.CreateBitCast(Buf, PointerType::get(Int8Ty, 0)),
                   SafeLen
+              });
+            }
+
+            if (FnName == "readv" || FnName == "recvmsg") {
+              Instruction *Next = I.getNextNode();
+              if (!Next) continue;
+              IRBuilder<> TaintIRB(Next);
+
+              Value *Ret = Call;
+              if (!Ret->getType()->isIntegerTy()) continue;
+              Value *Ret32 = TaintIRB.CreateSExtOrTrunc(Ret, Int32Ty);
+              Value *HasInput = TaintIRB.CreateICmpSGT(Ret32, ConstantInt::get(Int32Ty, 0));
+              Value *SafeLen = TaintIRB.CreateSelect(
+                  HasInput, Ret32, ConstantInt::get(Int32Ty, 0));
+
+              if (FnName == "readv" && Call->getNumArgOperands() >= 3) {
+                TaintIRB.CreateCall(TaintSourceIovFn, {
+                    TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0)),
+                    TaintIRB.CreateZExtOrTrunc(Call->getArgOperand(2), Int32Ty),
+                    SafeLen
+                });
+              } else if (FnName == "recvmsg" && Call->getNumArgOperands() >= 2) {
+                TaintIRB.CreateCall(TaintSourceMsgFn, {
+                    TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0)),
+                    SafeLen
+                });
+              }
+            }
+
+            if ((FnName == "memcpy" || FnName == "memmove" || IsLlvmMemcpy) &&
+                Call->getNumArgOperands() >= 3) {
+              Instruction *Next = I.getNextNode();
+              if (!Next) continue;
+              IRBuilder<> TaintIRB(Next);
+              Value *Len = Call->getArgOperand(2);
+              if (!Len->getType()->isIntegerTy()) continue;
+              TaintIRB.CreateCall(TaintMemcpyFn, {
+                  TaintIRB.CreateBitCast(Call->getArgOperand(0), PointerType::get(Int8Ty, 0)),
+                  TaintIRB.CreateBitCast(Call->getArgOperand(1), PointerType::get(Int8Ty, 0)),
+                  TaintIRB.CreateZExtOrTrunc(Len, Int32Ty)
               });
             }
           }

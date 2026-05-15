@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #ifndef MAP_SIZE
@@ -167,6 +169,65 @@ void __afl_taint_source(u8* buf, u32 len) {
     if (i > TAINT_MAX_OFFSET) break;
     u32 idx = __afl_ptr_to_shadow_idx(&buf[i]);
     __afl_shadow_mem[idx] = (taint_tag_t)(i + 1);
+  }
+}
+
+/* Tag bytes received into an iovec array, preserving stream offsets. */
+void __afl_taint_source_iov(struct iovec* iov, u32 iovcnt, u32 len) {
+
+  if (!iov || !len) return;
+  if (iovcnt > 1024) iovcnt = 1024;
+
+  for (u32 i = 0; i < iovcnt && len; i++) {
+    u32 chunk = (iov[i].iov_len > len) ? len : (u32)iov[i].iov_len;
+    __afl_taint_source_net((u8*)iov[i].iov_base, chunk);
+    len -= chunk;
+  }
+}
+
+/* recvmsg() source helper. */
+void __afl_taint_source_msghdr(struct msghdr* msg, u32 len) {
+
+  if (!msg || !len) return;
+  __afl_taint_source_iov((struct iovec*)msg->msg_iov, (u32)msg->msg_iovlen, len);
+}
+
+/* Copy taint byte-for-byte across libc memory moves. */
+void __afl_taint_memcpy(void* dst, void* src, u32 len) {
+
+  if (!__afl_shadow_mem) __afl_init_shadow_mem();
+  if (!__afl_shadow_mem || !dst || !src || !len) return;
+
+  for (u32 i = 0; i < len; i++) {
+    u32 sidx = __afl_ptr_to_shadow_idx((u8*)src + i);
+    u32 didx = __afl_ptr_to_shadow_idx((u8*)dst + i);
+    __afl_shadow_mem[didx] = __afl_shadow_mem[sidx];
+  }
+}
+
+/* Scan a buffer and record every tainted byte that participates in a comparison. */
+void __afl_check_taint_buf(u32 cmp_id, void* ptr, u32 len) {
+
+  if (!__afl_taint_map || cmp_id >= MAX_CMP_ID || !ptr || !len) return;
+  if (!__afl_shadow_mem) __afl_init_shadow_mem();
+  if (!__afl_shadow_mem) return;
+
+  if (__afl_cmp_hit_map && !__afl_cmp_hit_map[cmp_id]) {
+    __afl_cmp_hit_map[cmp_id] = 1;
+    if (__afl_active_cmp_ids) {
+      u32 count = __afl_active_cmp_ids[0];
+      if (count < MAX_CMP_ID) {
+        __afl_active_cmp_ids[count + 1] = cmp_id;
+        __afl_active_cmp_ids[0] = count + 1;
+      }
+    }
+  }
+
+  if (len > 4096) len = 4096;
+  for (u32 i = 0; i < len; i++) {
+    u32 idx = __afl_ptr_to_shadow_idx((u8*)ptr + i);
+    taint_tag_t tag = __afl_shadow_mem[idx];
+    if (tag > 0 && tag <= (TAINT_MAX_OFFSET + 1)) __afl_mark_taint_offset(cmp_id, tag - 1);
   }
 }
 

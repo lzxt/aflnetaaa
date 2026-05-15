@@ -413,6 +413,29 @@ static inline u8 df_offset_in_region(struct queue_entry *q, u32 region_id, u32 o
          offset <= (u32)q->regions[region_id].end_byte;
 }
 
+enum {
+  TAINT_PROT_OTHER,
+  TAINT_PROT_FTP,
+  TAINT_PROT_HTTP,
+  TAINT_PROT_DTLS12
+};
+
+static u8 taint_protocol_id = TAINT_PROT_OTHER;
+
+static inline u32 UR(u32 limit);
+
+struct extra_data {
+  u8* data;                           /* Dictionary token data            */
+  u32 len;                            /* Dictionary token length          */
+  u32 hit_cnt;                        /* Use count in the corpus          */
+};
+
+static struct extra_data* extras;     /* Extra tokens to fuzz with        */
+static u32 extras_cnt;                /* Total number of tokens read      */
+
+static struct extra_data* a_extras;   /* Automatically selected extras    */
+static u32 a_extras_cnt;              /* Total number of tokens available */
+
 static inline u8 select_df_focused_region(struct queue_entry *q,
                                           u32 *start_region,
                                           u32 *region_count) {
@@ -442,6 +465,96 @@ static inline u8 select_df_focused_region(struct queue_entry *q,
   return 1;
 }
 
+static inline u8 taint_protect_structure_enabled(void) {
+  char *v = getenv("AFL_TAINT_PROTECT_STRUCT");
+  return (!v || v[0] != '0');
+}
+
+static inline u8 df_offset_is_protected(u8 *buf, u32 len, u32 off) {
+  if (!taint_protect_structure_enabled() || !buf || off >= len) return 0;
+
+  if (buf[off] == '\r' || buf[off] == '\n' || buf[off] == 0) return 1;
+
+  if (taint_protocol_id == TAINT_PROT_DTLS12 && off < 13) return 1;
+
+  if (taint_protocol_id == TAINT_PROT_HTTP) {
+    if (buf[off] == ':' && off + 1 < len && (buf[off + 1] == ' ' || buf[off + 1] == '\t')) return 1;
+  }
+
+  return 0;
+}
+
+static inline u8 df_span_has_protected_byte(u8 *buf, u32 len, u32 off, u32 span) {
+  if (!span || off >= len) return 1;
+  if (off + span > len) return 1;
+  for (u32 i = 0; i < span; i++) {
+    if (df_offset_is_protected(buf, len, off + i)) return 1;
+  }
+  return 0;
+}
+
+static u8 df_try_dictionary_overlay(u8 *out_buf, u8 *in_buf, u32 len, u32 key_offset) {
+  struct extra_data *dict = NULL;
+  u32 dict_cnt = 0;
+
+  if (a_extras_cnt && (!extras_cnt || UR(2))) {
+    dict = a_extras;
+    dict_cnt = MIN(a_extras_cnt, USE_AUTO_EXTRAS);
+  } else if (extras_cnt) {
+    dict = extras;
+    dict_cnt = extras_cnt;
+  }
+
+  if (!dict || !dict_cnt) return 0;
+
+  for (u32 tries = 0; tries < 8; tries++) {
+    struct extra_data *e = &dict[UR(dict_cnt)];
+    if (!e->len || e->len > 32 || e->len > len) continue;
+
+    u32 delta = UR(e->len);
+    if (key_offset < delta) delta = key_offset;
+    u32 start = key_offset - delta;
+    if (start + e->len > len) continue;
+    if (df_span_has_protected_byte(in_buf, len, start, e->len)) continue;
+    if (!memcmp(out_buf + start, e->data, e->len)) continue;
+
+    memcpy(out_buf + start, e->data, e->len);
+    return 1;
+  }
+
+  return 0;
+}
+
+static void write_taint_directed_stats(u32 guided_keys, u32 m2_key_count,
+                                       u32 protected_skips, u32 dict_uses,
+                                       u32 directed_execs, u32 directed_finds) {
+
+  static u8 header_written = 0;
+  if (!taint_analysis_enabled || !out_dir) return;
+
+  char *enabled = getenv("AFL_TAINT_STATS");
+  if (enabled && enabled[0] == '0') return;
+
+  u8 *fn = alloc_printf("%s/taint_directed_stats", out_dir);
+  FILE *f = fopen(fn, "a");
+  if (!f) {
+    ck_free(fn);
+    return;
+  }
+
+  if (!header_written) {
+    fprintf(f, "execs\tqueue\tguided_keys\tm2_key_count\tprotected_skips\tdict_uses\tdirected_execs\tdirected_finds\n");
+    header_written = 1;
+  }
+
+  fprintf(f, "%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+          total_execs, queued_paths, guided_keys, m2_key_count,
+          protected_skips, dict_uses, directed_execs, directed_finds);
+
+  fclose(f);
+  ck_free(fn);
+}
+
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
                           *queue_top, /* Top of the list                  */
@@ -452,18 +565,6 @@ static struct llm_seed_entry *llm_seed_queue = NULL,  /* LLM-generated seed queu
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
-
-struct extra_data {
-  u8* data;                           /* Dictionary token data            */
-  u32 len;                            /* Dictionary token length          */
-  u32 hit_cnt;                        /* Use count in the corpus          */
-};
-
-static struct extra_data* extras;     /* Extra tokens to fuzz with        */
-static u32 extras_cnt;                /* Total number of tokens read      */
-
-static struct extra_data* a_extras;   /* Automatically selected extras    */
-static u32 a_extras_cnt;              /* Total number of tokens available */
 
 static u8* (*post_handler)(u8* buf, u32* len);
 
@@ -4328,6 +4429,43 @@ static void write_crash_readme(void) {
 }
 
 
+/* Append lightweight taint diagnostics. This is intentionally append-only so
+   long fuzzing runs can be inspected without attaching a debugger. */
+
+static void write_taint_stats(u8 hnb, u32 active_cmp_count, u8 cmp_triggered,
+                              u8 df_change, u32 total_cmp_tainted,
+                              u32 new_df_cmp, u32 frontier_new_cmp,
+                              u8 saved_df, const char *reason) {
+
+  static u8 header_written = 0;
+
+  if (!taint_analysis_enabled || !out_dir) return;
+
+  char *enabled = getenv("AFL_TAINT_STATS");
+  if (enabled && enabled[0] == '0') return;
+
+  u8 *fn = alloc_printf("%s/taint_stats", out_dir);
+  FILE *f = fopen(fn, "a");
+  if (!f) {
+    ck_free(fn);
+    return;
+  }
+
+  if (!header_written) {
+    fprintf(f, "execs\tqueue\thnb\tactive_cmp\tcmp_triggered\tdf_change\ttainted_cmp\tnew_df_cmp\tfrontier_new_cmp\tsaved_df\treason\n");
+    header_written = 1;
+  }
+
+  fprintf(f, "%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n",
+          total_execs, queued_paths, hnb, active_cmp_count, cmp_triggered,
+          df_change, total_cmp_tainted, new_df_cmp, frontier_new_cmp,
+          saved_df, reason ? reason : "-");
+
+  fclose(f);
+  ck_free(fn);
+
+}
+
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
@@ -4355,6 +4493,10 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         u8 cmp_triggered = 0;
         u32 total_cmp_tainted = 0;
         u32 new_df_cmp = 0;
+        u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
+        u32 frontier_new_cmp = 0;
+        u8 saved_df = 0;
+        const char *df_skip_reason = "no_df_change";
         u8 cmp_has_new_df[MAX_CMP_ID];
         memset(cmp_has_new_df, 0, sizeof(cmp_has_new_df));
         
@@ -4395,9 +4537,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         
         if (df_change && cmp_triggered) {
           /* Frontier-aware check: only new DF on still-frontier CMPs is valuable. */
-          u32 frontier_new_cmp = 0;
           if (cmp_hit_shm && cmp_frontier_global) {
-            u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
             for (u32 idx = 0; idx < active_cmp_count; idx++) {
               u32 cid = active_cmp_ids_shm[idx + 1];
               if (cid >= MAX_CMP_ID) continue;
@@ -4407,9 +4547,14 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
             }
           }
           u8 leads_to_uncovered = frontier_new_cmp > 0;
+          if (!cmp_triggered) df_skip_reason = "no_tainted_cmp";
+          else if (!df_change) df_skip_reason = "no_new_df";
+          else if (!frontier_new_cmp) df_skip_reason = "no_frontier_new_df";
+          else df_skip_reason = "save_df";
           
           /* 如果数据流变化且通向未覆盖区域，标记为 DF_Interesting */
           if (leads_to_uncovered) {
+            saved_df = 1;
             df_interesting_seed = 1;
             /* Still save to queue for directed mutation */
             fn = alloc_printf("%s/queue/id:%06u,df_interesting", out_dir, queued_paths);
@@ -4522,6 +4667,9 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
                 }
               }
             }
+            write_taint_stats(hnb, active_cmp_count, cmp_triggered, df_change,
+                              total_cmp_tainted, new_df_cmp, frontier_new_cmp,
+                              saved_df, df_skip_reason);
             return 1;
           }
           
@@ -4539,6 +4687,15 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
             }
           }
         }
+
+        if (!saved_df) {
+          if (!cmp_triggered) df_skip_reason = "no_tainted_cmp";
+          else if (!df_change) df_skip_reason = "no_new_df";
+          else if (!frontier_new_cmp) df_skip_reason = "no_frontier_new_df";
+          write_taint_stats(hnb, active_cmp_count, cmp_triggered, df_change,
+                            total_cmp_tainted, new_df_cmp, frontier_new_cmp,
+                            saved_df, df_skip_reason);
+        }
         
       }
       
@@ -4551,6 +4708,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     
     /* Reset DF interesting flag when new edge is found */
     if (taint_analysis_enabled) {
+      if (taint_map_shm) {
+        u32 active_cmp_count = active_cmp_ids_shm ? active_cmp_ids_shm[0] : 0;
+        write_taint_stats(hnb, active_cmp_count, 0, 0, 0, 0, 0, 0,
+                          "new_coverage_cf_seed");
+      }
       df_interesting_seed = 0;
       last_new_edge_time = get_cur_time();
       df_heating_mode = 0; /* Cooling: return budget to CF discovery */
@@ -7782,6 +7944,10 @@ taint_directed_stage:;
     if (key_count > 0) {
       u32 guided_keys = df_directed_key_budget(queue_cur, key_count, len);
       u32 reps = df_directed_reps(queue_cur, len);
+      u32 m2_key_count = key_count;
+      u32 protected_skips = 0;
+      u32 dict_uses = 0;
+      u32 directed_execs = 0;
       if (!guided_keys || !reps) guided_keys = 0;
       if (guided_keys && guided_keys > 0x7fffffff / reps) stage_max = 0x7fffffff;
       else stage_max = (s32)(guided_keys * reps);
@@ -7790,42 +7956,51 @@ taint_directed_stage:;
 
       for (u32 ki = 0; ki < guided_keys; ki++) {
         u32 key_offset = key_offsets[ki];
+        if (df_offset_is_protected(in_buf, len, key_offset)) {
+          protected_skips++;
+          continue;
+        }
+
         for (u32 rep = 0; rep < reps; rep++) {
           stage_cur++;
 
-          switch (UR(5)) {
-            case 0:
-              FLIP_BIT(out_buf, key_offset * 8 + UR(8));
-              break;
+          if ((extras_cnt || a_extras_cnt) && UR(100) < 35 &&
+              df_try_dictionary_overlay(out_buf, in_buf, len, key_offset)) {
+            dict_uses++;
+          } else {
+            switch (UR(5)) {
+              case 0:
+                FLIP_BIT(out_buf, key_offset * 8 + UR(8));
+                break;
 
-            case 1:
-              out_buf[key_offset] = interesting_8[UR(sizeof(interesting_8))];
-              break;
+              case 1:
+                out_buf[key_offset] = interesting_8[UR(sizeof(interesting_8))];
+                break;
 
-            case 2:
-              if (UR(2)) out_buf[key_offset]++;
-              else out_buf[key_offset]--;
-              break;
+              case 2:
+                if (UR(2)) out_buf[key_offset]++;
+                else out_buf[key_offset]--;
+                break;
 
-            case 3:
-              if (key_offset + 1 < len) {
-                if (UR(2))
-                  *(u16*)(out_buf + key_offset) = interesting_16[UR(sizeof(interesting_16) >> 1)];
-                else
-                  *(u16*)(out_buf + key_offset) = SWAP16(interesting_16[UR(sizeof(interesting_16) >> 1)]);
-              }
-              break;
+              case 3:
+                if (key_offset + 1 < len && !df_span_has_protected_byte(in_buf, len, key_offset, 2)) {
+                  u16 v = UR(2) ? interesting_16[UR(sizeof(interesting_16) >> 1)] :
+                                  SWAP16(interesting_16[UR(sizeof(interesting_16) >> 1)]);
+                  memcpy(out_buf + key_offset, &v, 2);
+                }
+                break;
 
-            case 4:
-              if (key_offset + 3 < len) {
-                if (UR(2))
-                  *(u32*)(out_buf + key_offset) = interesting_32[UR(sizeof(interesting_32) >> 2)];
-                else
-                  *(u32*)(out_buf + key_offset) = SWAP32(interesting_32[UR(sizeof(interesting_32) >> 2)]);
-              }
-              break;
+              case 4:
+                if (key_offset + 3 < len && !df_span_has_protected_byte(in_buf, len, key_offset, 4)) {
+                  u32 v = UR(2) ? interesting_32[UR(sizeof(interesting_32) >> 2)] :
+                                  SWAP32(interesting_32[UR(sizeof(interesting_32) >> 2)]);
+                  memcpy(out_buf + key_offset, &v, 4);
+                }
+                break;
+            }
           }
 
+          directed_execs++;
           if (common_fuzz_stuff(argv, out_buf, len)) {
             if (key_offsets) ck_free(key_offsets);
             goto abandon_entry;
@@ -7836,8 +8011,11 @@ taint_directed_stage:;
 
       if (key_offsets) ck_free(key_offsets);
       new_hit_cnt = queued_paths + unique_crashes;
-      stage_finds[STAGE_HAVOC] += new_hit_cnt - orig_hit_cnt;
-      stage_cycles[STAGE_HAVOC] += stage_max;
+      u32 directed_finds = (u32)(new_hit_cnt - orig_hit_cnt);
+      stage_finds[STAGE_HAVOC] += directed_finds;
+      stage_cycles[STAGE_HAVOC] += directed_execs;
+      write_taint_directed_stats(guided_keys, m2_key_count, protected_skips,
+                                 dict_uses, directed_execs, directed_finds);
     }
     
   }
@@ -10324,12 +10502,14 @@ int main(int argc, char** argv) {
         } else if (!strcmp(optarg, "FTP")) {
           extract_requests = &extract_requests_ftp;
           extract_response_codes = &extract_response_codes_ftp;
+          taint_protocol_id = TAINT_PROT_FTP;
         } else if (!strcmp(optarg, "MQTT")) {
           extract_requests = &extract_requests_mqtt;
           extract_response_codes = &extract_response_codes_mqtt;
         } else if (!strcmp(optarg, "DTLS12")) {
           extract_requests = &extract_requests_dtls12;
           extract_response_codes = &extract_response_codes_dtls12;
+          taint_protocol_id = TAINT_PROT_DTLS12;
         } else if (!strcmp(optarg, "DNS")) {
           extract_requests = &extract_requests_dns;
           extract_response_codes = &extract_response_codes_dns;
@@ -10351,9 +10531,11 @@ int main(int argc, char** argv) {
         } else if (!strcmp(optarg, "HTTP")) {
           extract_requests = &extract_requests_http;
           extract_response_codes = &extract_response_codes_http;
+          taint_protocol_id = TAINT_PROT_HTTP;
         } else if (!strcmp(optarg, "UPNP")) {
           extract_requests = &extract_requests_upnp;
           extract_response_codes = &extract_response_codes_upnp;
+          taint_protocol_id = TAINT_PROT_HTTP;
           upnp_mode = 1;
         } else if (!strcmp(optarg, "IPP")) {
           extract_requests = &extract_requests_ipp;
